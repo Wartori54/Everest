@@ -1,3 +1,9 @@
+<!-- 
+    This file is not actually in use by any component in Everest nor its splash rather it is only in here for reference 
+    purposes, since the loaded fontbmp definition for the splash is `renogare.bin` (for performance purposes), debugging 
+    with that file format may be harder, as such this file just contains the exact same data in xml format, which is 
+    human readable. 
+-->
 <?xml version="1.0"?>
 <font>
     <info face="Renogare" size="-64" bold="0" italic="0" charset="" unicode="1" stretchH="100" smooth="0" aa="1" padding="0,0,0,0" spacing="1,1" outline="0"/>
