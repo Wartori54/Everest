@@ -5,7 +5,6 @@ using System.IO;
 using System.IO.Pipes;
 using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Threading.Tasks;
 using System.Timers;
 
@@ -143,10 +142,6 @@ public class EverestSplashWindow {
 
     private FontLoader? renogareFont;
     private LoadingProgress _loadingProgress = new(0, 0, "");
-    private readonly Randomness randomness;
-
-    private bool rightSidedWheel = false;
-    private string loadingText = "Loading {0}";
 
     private LoadingProgress loadingProgress {
         get => _loadingProgress;
@@ -169,7 +164,7 @@ public class EverestSplashWindow {
             
             
             windowInfo.modLoadingProgressCache?.SetText(
-                $"{string.Format(loadingText, new string(sanitizedName))} [{_loadingProgress.loadedMods}/{_loadingProgress.totalMods}]");
+                $"Loading {sanitizedName.AsSpan()} [{_loadingProgress.loadedMods}/{_loadingProgress.totalMods}]");
         }
     }
 
@@ -183,9 +178,6 @@ public class EverestSplashWindow {
         instance = this;
         targetRenderer = targetRendererName;
         currentAssembly = GetType().Assembly;
-        randomness = new Randomness {
-            ForceChance = Environment.GetEnvironmentVariable("EVERESTSPLASH_FORCE_CHANCE") == "1"
-        };
         
         string serverName = EverestSplash.Name + postFix;
         Console.WriteLine("Running splash on " + serverName);
@@ -295,10 +287,6 @@ public class EverestSplashWindow {
         FNA3D.FNA3D_Image_Free(appIconPixels);
         
         // Okay, good code continues here
-
-        if (randomness.WithChance(0.05)) {
-            rightSidedWheel = true;
-        }
     }
 
     private void LoadTextures() {
@@ -336,8 +324,6 @@ public class EverestSplashWindow {
         string[] startingCelesteText = { // DO Make sure that the longest string goes first, for caching reasons
             "Starting Celeste...", "Starting Celeste", "Starting Celeste.", "Starting Celeste.."
         };
-        if (randomness.WithChance(0.05))
-            (startingCelesteText[1], startingCelesteText[3]) = (startingCelesteText[3], startingCelesteText[1]);
         AnimTimer(500, () => {
             windowInfo.startingEverestFontCache.SetText(startingCelesteText[startEverestSpriteIdx]);
             startEverestSpriteIdx = (startEverestSpriteIdx + 1) % startingCelesteText.Length;
@@ -401,7 +387,7 @@ public class EverestSplashWindow {
             // Background wheel
             float scale = (float) WindowWidth / windowInfo.wheelTexture.Width;
             SDL.SDL_Rect wheelRect = new() {
-                x = (int)(-windowInfo.wheelTexture.Width*scale/2 + (rightSidedWheel ? WindowWidth : 0)),
+                x = (int)(-windowInfo.wheelTexture.Width*scale/2),
                 y = (int)(-windowInfo.wheelTexture.Height*scale/2),
                 w = (int)(windowInfo.wheelTexture.Width*scale),
                 h = (int)(windowInfo.wheelTexture.Height*scale),
@@ -583,19 +569,6 @@ public class EverestSplashWindow {
 
     public record LoadingProgress(int loadedMods, int totalMods, string lastMod, bool raw = false);
 
-    public class Randomness {
-        private Random rng;
-
-        public bool ForceChance = false;
-        public Randomness(int? seed = null) {
-            rng = seed == null ? new Random() : new Random(seed.Value);
-        }
-
-        public bool WithChance(double chance) {
-            if (ForceChance) return true;
-            return rng.NextDouble() <= chance;
-        }
-    }
 
     /// <summary>
     /// Stripped down version of https://github.com/FNA-XNA/FNA/blob/master/src/Graphics/FNA3D.cs, suited for our needs.
