@@ -296,14 +296,6 @@ public class EverestSplashWindow {
         
         // Okay, good code continues here
 
-        if (randomness.WithChance(0.01)) {
-            // May be expanded on the future
-            string[] possibleTexts = {
-                "Adding {0} to the pie",
-            };
-            loadingText = possibleTexts[new Random().Next(possibleTexts.Length)];
-        }
-
         if (randomness.WithChance(0.05)) {
             rightSidedWheel = true;
         }
