@@ -24,10 +24,11 @@ steps:
   
 - task: NuGetToolInstaller@1
 
-- task: NuGetCommand@2
+- task: DotNetCoreCLI@2
   displayName: 'Restore NuGet packages'
   inputs:
-    restoreSolution: '$(solution)'
+    command: 'restore'
+    projects: '$(solution)'
 
 - task: PowerShell@2
   displayName: 'Run .azure-pipelines/prebuild.ps1'
