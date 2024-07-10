@@ -16,6 +16,12 @@ name: '$(Build.BuildId)+$(Build.BuildIdOffset)'
 
 steps:
 # Pre-build steps.
+  
+- task: UseDotNet@2
+  displayName: 'Set up .NET'
+  inputs: # packageType defaults to sdk
+    useGlobalJson: true # Config via global.json
+  
 - task: NuGetToolInstaller@1
 
 - task: NuGetCommand@2
