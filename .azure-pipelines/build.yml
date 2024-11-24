@@ -21,7 +21,7 @@ steps:
 - task: UseDotNet@2
   displayName: 'Set up .NET'
   inputs: # packageType defaults to sdk
-    version: 8.x
+    version: 9.x # net9.0 required by MonoMod
 
 - task: DotNetCoreCLI@2
   displayName: 'Restore NuGet packages'
