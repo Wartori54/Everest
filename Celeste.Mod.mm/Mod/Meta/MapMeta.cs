@@ -536,6 +536,7 @@ namespace Celeste.Mod.Meta {
         public bool Rotate { get; set; } = false;
         public bool ShowCore { get; set; } = false;
         public bool ShowSnow { get; set; } = true;
+        public string MarkerTexture { get; set; } = null;
 
     }
     public class MapMetaMountainCamera {

@@ -422,7 +422,7 @@ namespace Celeste.Mod.UI {
         }
 
         private void downloadDependency(ModUpdateInfo mod, EverestModuleMetadata installedVersion) {
-            string downloadDestination = Path.Combine(Everest.PathGame, $"dependency-download.zip");
+            string downloadDestination = Path.Combine(Everest.PathTmp, $"dependency-download.zip");
             try {
                 // 1. Download
                 Func<int, long, int, bool> progressCallback = (position, length, speed) => {

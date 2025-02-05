@@ -8,7 +8,7 @@ namespace Celeste.Mod.Helpers {
 
         // I'm overcomplicating this. -ade
 
-        private static readonly string Dummy = Path.Combine(Everest.PathGame, "FileProxyStreamDummy.txt");
+        private static readonly string Dummy = Path.Combine(Everest.PathTmp, "FileProxyStreamDummy.txt");
 
         public readonly Stream Inner;
 

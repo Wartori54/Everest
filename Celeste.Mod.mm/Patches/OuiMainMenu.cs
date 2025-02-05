@@ -18,6 +18,16 @@ namespace Celeste {
         public List<MenuButton> Buttons => buttons;
         private MainMenuClimb climbButton;
 
+        [MonoModReplace]
+        public new Color SelectionColor {
+            get {
+                if (CoreModule.Settings.AllowTextHighlight && !base.Scene.BetweenInterval(0.1f)) {
+                    return TextMenu.HighlightColorB;
+                }
+                return TextMenu.HighlightColorA;
+            }
+        }
+
         public extern void orig_CreateButtons();
         public new void CreateButtons() {
             orig_CreateButtons();

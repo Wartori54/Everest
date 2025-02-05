@@ -302,13 +302,20 @@ namespace Celeste {
                 patch_AreaData area = Areas[i];
                 string path = area.Mode[0].Path;
                 ParseName(path, out int? order, out AreaMode side, out string name);
+                if (side == AreaMode.Normal) continue;
+
+                Logger.Verbose("AreaData", $"Checking for area to attach {side} {i} ({area.Mode[0].Path}) to...");
 
                 for (int ii = 0; ii < Areas.Count; ii++) {
                     patch_AreaData other = Areas[ii];
                     ParseName(other.Mode[0].Path, out int? otherOrder, out AreaMode otherSide, out string otherName);
+                    if (otherSide != AreaMode.Normal) continue;
 
                     if (area.LevelSet == other.LevelSet && order == otherOrder && name == otherName && side != otherSide &&
                         !other.HasMode(side)) {
+
+                        Logger.Verbose("AreaData", $"Found: {ii} ({other.Mode[0].Path})");
+
                         if (other.Mode[(int) side] == null)
                             other.Mode[(int) side] = new patch_ModeProperties {
                                 Inventory = PlayerInventory.Default,
