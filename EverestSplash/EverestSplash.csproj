@@ -6,6 +6,7 @@
         <Nullable>enable</Nullable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
         <UseAppHost>false</UseAppHost> <!-- EverestSplash will create its own AppHosts -->
+        <LangVersion>latest</LangVersion>
     </PropertyGroup>
     
     <ItemGroup>

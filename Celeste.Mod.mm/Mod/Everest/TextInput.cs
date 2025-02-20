@@ -1,6 +1,6 @@
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Input;
-using SDL2;
+using SDL3;
 using System;
 
 namespace Celeste.Mod {

@@ -340,10 +340,12 @@ header {
                     Name = "Focus Game",
                     InfoHTML = "Refocus the game window. Doesn't work on Windows 10.",
                     Handle = c => {
-                        if (SDL_RaiseWindow != null)
-                            SDL_RaiseWindow(Celeste.Instance.Window.Handle);
-                        else
-                            SetForegroundWindow(Celeste.Instance.Window.Handle);
+                        // if (SDL_RaiseWindow != null)
+                        //     SDL_RaiseWindow(Celeste.Instance.Window.Handle);
+                        // else
+                        //     SetForegroundWindow(Celeste.Instance.Window.Handle);
+                        SDL3.SDL.SDL_RaiseWindow(Celeste.Instance.Window.Handle);
+
 
                         Write(c, "OK");
                     }
@@ -610,8 +612,8 @@ header {
             [return: MarshalAs(UnmanagedType.Bool)]
             private static extern bool SetForegroundWindow(IntPtr hWnd);
 
-            private static Type SDL = typeof(Game).Assembly.GetType("SDL2.SDL");
-            private static Action<IntPtr> SDL_RaiseWindow = SDL?.GetMethod("SDL_RaiseWindow")?.CreateDelegate<Action<IntPtr>>(null);
+            // private static Type SDL = typeof(Game).Assembly.GetType("SDL3.SDL");
+            // private static Func<IntPtr, byte> SDL_RaiseWindow = SDL?.GetMethod("SDL_RaiseWindow")?.CreateDelegate<Func<IntPtr, byte>>(null);
 
             private class SessionInfo {
 

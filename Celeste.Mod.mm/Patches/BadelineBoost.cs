@@ -25,14 +25,14 @@ namespace MonoMod {
     class PatchBadelineBoostBoostRoutineAttribute : Attribute { }
     static partial class MonoModRules {
         public static void PatchBadelineBoostBoostRoutine(MethodDefinition method, CustomAttribute attrib) {
-            MethodDefinition routine = method.GetEnumeratorMoveNext();
-            new ILContext(routine).Invoke(ctx => {
-                ILCursor cursor = new ILCursor(ctx);
-
-                // remove Console.WriteLine("TIME: " + sw.ElapsedMilliseconds);
-                cursor.GotoNext(MoveType.AfterLabel, instr => instr.MatchLdstr("TIME: "));
-                cursor.RemoveRange(7);
-            });
+            // MethodDefinition routine = method.GetEnumeratorMoveNext();
+            // new ILContext(routine).Invoke(ctx => {
+            //     ILCursor cursor = new ILCursor(ctx);
+            //
+            //     // remove Console.WriteLine("TIME: " + sw.ElapsedMilliseconds);
+            //     cursor.GotoNext(MoveType.AfterLabel, instr => instr.MatchLdstr("TIME: "));
+            //     cursor.RemoveRange(7);
+            // });
         }
     }
 }

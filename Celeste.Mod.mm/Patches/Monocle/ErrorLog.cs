@@ -10,7 +10,7 @@ using Mono.Cecil.Cil;
 using MonoMod.Cil;
 using MonoMod.InlineRT;
 using Celeste.Mod.Helpers;
-using SDL2;
+using SDL3;
 using System.IO;
 
 namespace Monocle {

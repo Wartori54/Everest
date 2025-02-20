@@ -8,7 +8,7 @@ using FMOD.Studio;
 using Microsoft.Xna.Framework;
 using Monocle;
 using MonoMod;
-using SDL2;
+using SDL3;
 using System;
 using System.Collections.Generic;
 using System.IO;

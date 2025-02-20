@@ -70,14 +70,14 @@
     <Content Remove="..\lib-ext\FNA3D.patch" />
   </ItemGroup>
 
-  <ItemGroup>
-    <None Include="../lib-stripped/Celeste.xml">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Include="../lib-stripped/FNA.xml">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-  </ItemGroup>
+<!--  <ItemGroup>-->
+<!--    <None Include="../lib-stripped/Celeste.xml">-->
+<!--      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>-->
+<!--    </None>-->
+<!--    <None Include="../lib-stripped/FNA.xml">-->
+<!--      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>-->
+<!--    </None>-->
+<!--  </ItemGroup>-->
 
   <ItemGroup>
     <ProjectReference Include="..\DiscordGameSDK\DiscordGameSDK.csproj" />

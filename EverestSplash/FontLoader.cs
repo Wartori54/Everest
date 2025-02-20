@@ -1,7 +1,8 @@
-using EverestSplash.SDL2;
+using EverestSplash.SDL3;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.CompilerServices;
 
 namespace EverestSplash;
 
@@ -127,17 +128,17 @@ public class FontLoader : IDisposable {
     /// Draws a string into a renderer.
     /// </summary>
     /// <param name="text">The text to draw, all characters must be in the font.</param>
-    /// <param name="renderer">A valid SDL2 renderer.</param>
+    /// <param name="renderer">A valid SDL3 renderer.</param>
     /// <param name="origin">The position where the text should be drawn.</param>
     // TODO: New line support
     public void DrawText(string text, IntPtr renderer, SDL.SDL_Point origin) {
-        SDL.SDL_Rect srcRect = new() {
+        SDL.SDL_FRect srcRect = new() {
             x = 0,
             y = 0,
             w = 0,
             h = 0,
         };
-        SDL.SDL_Rect dstRect = new() {
+        SDL.SDL_FRect dstRect = new() {
             x = 0,
             y = 0,
             w = 0,
@@ -159,7 +160,7 @@ public class FontLoader : IDisposable {
             dstRect.y = cy + charSize.Yoffset; // Yoffset is the distance between the line top and the first char pixel
             dstRect.x = cx + charSize.Xoffset; // Xoffset is how much we must move from the last post
 
-            if (SDL.SDL_RenderCopy(renderer, fontTexture.Handle, ref srcRect, ref dstRect) != 0) 
+            if (!SDL.SDL_RenderTexture(renderer, fontTexture.Handle, ref srcRect, ref dstRect)) 
                 throw new InvalidOperationException("Cannot DrawText: " + SDL.SDL_GetError());
 
             cx += charSize.Xadvance; // Xadvance is how much this character makes the cursor move
@@ -192,8 +193,8 @@ public class FontLoader : IDisposable {
     /// Obtains the SDL_PixelFormat that the font texture is using
     /// </summary>
     /// <returns>A SDL_PixelFormat.</returns>
-    public uint GetFontFormat() {
-        return fontTexture.Format;
+    public SDL.SDL_PixelFormat GetFontFormat() {
+        return (SDL.SDL_PixelFormat)fontTexture.Format;
     }
     
     /// <summary>
@@ -249,7 +250,7 @@ public class FontCache : IDisposable {
     /// <param name="renderer">The current renderer.</param>
     /// <param name="origin">The location where the text should be drawn.</param>
     /// <param name="scale">Scale of the text, depends on the font size</param>
-    public void Render(IntPtr renderer, SDL.SDL_Point origin, float scale = 1f) {
+    public void Render(IntPtr renderer, SDL.SDL_FPoint origin, float scale = 1f) {
         if (renderedText == "") return;
         RenderToCache(renderer);
         if (cachedTexture == null || cachedTexture.Handle == IntPtr.Zero) throw new Exception("Could not render to cache!");
@@ -259,7 +260,7 @@ public class FontCache : IDisposable {
             w = cachedTexture.Width * scale,
             h = cachedTexture.Height * scale,
         };
-        if (SDL.SDL_RenderCopyF(renderer, cachedTexture.Handle, IntPtr.Zero, ref dstRect) != 0)
+        if (!SDL.SDL_RenderTexture(renderer, cachedTexture.Handle, ref Unsafe.NullRef<SDL.SDL_FRect>(), ref dstRect))
             throw new Exception("Could not render texture to renderer!");
     }
 
@@ -276,14 +277,15 @@ public class FontCache : IDisposable {
             IntPtr texPtr = SDL.SDL_CreateTexture(
                 renderer,
                 fontRenderer.GetFontFormat(),
-                (int) SDL.SDL_TextureAccess.SDL_TEXTUREACCESS_TARGET,
+                SDL.SDL_TextureAccess.SDL_TEXTUREACCESS_TARGET,
                 textSize.x,
                 textSize.y
             );
             if (texPtr == IntPtr.Zero)
                 throw new Exception("Could not create texture: " + SDL.SDL_GetError());
             cachedTexture = new STexture(texPtr);
-            SDL.SDL_SetTextureBlendMode(cachedTexture.Handle, SDL.SDL_BlendMode.SDL_BLENDMODE_BLEND); // The texture has transparency
+            // This happens by default now
+            // SDL.SDL_SetTextureBlendMode(cachedTexture.Handle, SDL.SDL_BlendMode.SDL_BLENDMODE_BLEND); // The texture has transparency
         }
         
         if (cachedTexture.Handle == IntPtr.Zero)
@@ -297,8 +299,8 @@ public class FontCache : IDisposable {
         cacheValid = true;
     }
 
-    public SDL.SDL_Point GetCachedTextureSize() {
-        return new SDL.SDL_Point {
+    public SDL.SDL_FPoint GetCachedTextureSize() {
+        return new SDL.SDL_FPoint {
             x = cachedTexture?.Width ?? 0,
             y = cachedTexture?.Height ?? 0,
         };

@@ -1,9 +1,10 @@
-﻿using EverestSplash.SDL2;
+﻿using EverestSplash.SDL3;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Pipes;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -61,7 +62,7 @@ public static class EverestSplash {
     /// <summary>
     /// This method always requires the targetRenderer, for ease of use with reflection.
     /// </summary>
-    /// <param name="targetRenderer">The SDL2 renderer to use or "" for any renderer.</param>
+    /// <param name="targetRenderer">The SDL3 renderer to use or "" for any renderer.</param>
     /// <param name="postFix">A post fix to the server name, to not conflict with other instances</param>
     /// <returns>The window created.</returns>
     public static EverestSplashWindow CreateWindow(string targetRenderer = "", string postFix = "") {
@@ -180,6 +181,7 @@ public class EverestSplashWindow {
     private EverestSplashWindow(string targetRendererName, string postFix) {
         instance = this;
         targetRenderer = targetRendererName;
+        targetRenderer = ""; // TODO: Do not inherit the renderer for now, Vulkan seems broken
         currentAssembly = GetType().Assembly;
         
         string serverName = EverestSplash.Name + postFix;
@@ -223,7 +225,7 @@ public class EverestSplashWindow {
             }
             Console.WriteLine("Exiting splash...");
             SDL.SDL_Event userEvent = new() { // Fake a user event, we don't need anything fancier for now
-                type = SDL.SDL_EventType.SDL_USEREVENT,
+                type = (uint) SDL.SDL_EventType.SDL_EVENT_USER,
             };
             SDL.SDL_PushEvent(ref userEvent); // This is thread safe :)
         }, tokenSource.Token);
@@ -254,26 +256,26 @@ public class EverestSplashWindow {
             WindowWidth = (int) (720.0 * 16 / 9); // 1280
         }
 
-        if (SDL.SDL_Init(SDL.SDL_INIT_VIDEO | SDL.SDL_INIT_EVENTS) != 0) { // Init as little as we can, we need to go fast
+        if (!SDL.SDL_InitSubSystem(SDL.SDL_InitFlags.SDL_INIT_VIDEO | SDL.SDL_InitFlags.SDL_INIT_EVENTS)) { // Init as little as we can, we need to go fast
             throw new Exception("Failed to SDL init!\n" + SDL.SDL_GetError());
         }
-
-        IntPtr window = SDL.SDL_CreateWindow(WindowTitle, SDL.SDL_WINDOWPOS_CENTERED, SDL.SDL_WINDOWPOS_CENTERED,
-            WindowWidth, WindowHeight, SDL.SDL_WindowFlags.SDL_WINDOW_BORDERLESS | SDL.SDL_WindowFlags.SDL_WINDOW_HIDDEN);
+        
+        // SDL3.cs doesnt ship this anymore
+        const int SDL_WINDOWPOS_CENTERED = 0x2FFF0000;
+        IntPtr window = SDL.SDL_CreateWindow(WindowTitle, WindowWidth, WindowHeight, SDL.SDL_WindowFlags.SDL_WINDOW_BORDERLESS | SDL.SDL_WindowFlags.SDL_WINDOW_HIDDEN);
+        SDL.SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
         if (window == IntPtr.Zero)
             throw new Exception("Failed to create window!\n" + SDL.SDL_GetError());
 
-        IntPtr renderer = SDL.SDL_CreateRenderer(window, GetSDLRendererIdx(),
-            SDL.SDL_RendererFlags.SDL_RENDERER_ACCELERATED 
-            | SDL.SDL_RendererFlags.SDL_RENDERER_PRESENTVSYNC 
-            | SDL.SDL_RendererFlags.SDL_RENDERER_TARGETTEXTURE /* Required for fast font rendering */);
+        IntPtr renderer = SDL.SDL_CreateRenderer(window, targetRenderer);
+        SDL.SDL_SetRenderVSync(renderer, 1); // Enable vsync
         if (renderer == IntPtr.Zero)
             throw new Exception("Failed to create renderer!\n" + SDL.SDL_GetError());
 
         windowInfo = new WindowInfo() { window = window, renderer = renderer, };
-        SDL.SDL_SetHint( SDL.SDL_HINT_RENDER_SCALE_QUALITY, "1");
+        // SDL.SDL_SetHint( SDL.SDL_HINT_RENDER_SCALE_QUALITY, "1"); // Linear scaling is on by default now
         
-        // Ugly part, look a way for a sec
+        // Ugly part, look away for a sec
         // This is the only place where we have a good reason to load an image into a surface, so no abstraction here
         using Stream appIconStream = File.Exists(AppIcon.path)
             ? File.OpenRead(AppIcon.path)
@@ -281,20 +283,21 @@ public class EverestSplashWindow {
         IntPtr appIconPixels = FNA3D.ReadImageStream(appIconStream, out int w, out int h, out int _);
         if (appIconPixels == IntPtr.Zero) 
             throw new Exception("Could not read stream!");
-                
-        IntPtr appIconSurface = SDL.SDL_CreateRGBSurfaceFrom(appIconPixels,
-            w, 
-            h, 
-            8 * 4 /* byte per 4 channels */, 
-            w * 4, 
-            0x000000FF, 
-            0x0000FF00,
-            0x00FF0000, 
-            0xFF000000);
+        
+        IntPtr appIconSurface = SDL.SDL_CreateSurfaceFrom(w, h, SDL.SDL_PixelFormat.SDL_PIXELFORMAT_ABGR8888, appIconPixels, w*4);
+        // IntPtr appIconSurface = SDL.SDL_CreateRGBSurfaceFrom(appIconPixels,
+        //     w, 
+        //     h, 
+        //     8 * 4 /* byte per 4 channels */, 
+        //     w * 4, 
+        //     0x000000FF, 
+        //     0x0000FF00,
+        //     0x00FF0000, 
+        //     0xFF000000);
         if (appIconSurface == IntPtr.Zero) 
             throw new Exception("Could not create surface! " + SDL.SDL_GetError());
         SDL.SDL_SetWindowIcon(window, appIconSurface);
-        SDL.SDL_FreeSurface(appIconSurface); // Here the surface has already been copied so its safe to free
+        SDL.SDL_DestroySurface(appIconSurface); // Here the surface has already been copied so its safe to free
         FNA3D.FNA3D_Image_Free(appIconPixels);
         
         // Okay, good code continues here
@@ -340,8 +343,8 @@ public class EverestSplashWindow {
             startEverestSpriteIdx = (startEverestSpriteIdx + 1) % startingCelesteText.Length;
         });
         
-        int realBgH = windowInfo.bgGradientTexture.Height * WindowWidth / windowInfo.bgGradientTexture.Width;
-        int bgBloomPos = -realBgH/2;
+        float realBgH = windowInfo.bgGradientTexture.Height * WindowWidth / windowInfo.bgGradientTexture.Width;
+        float bgBloomPos = -realBgH/2;
         AnimTimer(16, () => {
             bgBloomPos += 1;
             if (bgBloomPos > realBgH/2) {
@@ -367,11 +370,11 @@ public class EverestSplashWindow {
 
         while (true) { // while true :trolloshiro: (on a serious note, for our use case its fineee :))
             
-            while (SDL.SDL_PollEvent(out SDL.SDL_Event e) != 0) {
+            while (SDL.SDL_PollEvent(out SDL.SDL_Event e)) {
                 // An SDL_USEREVENT is sent when the splash receives the quit command
-                if (e.type is SDL.SDL_EventType.SDL_QUIT or SDL.SDL_EventType.SDL_USEREVENT) {
+                if ((SDL.SDL_EventType) e.type is SDL.SDL_EventType.SDL_EVENT_QUIT or SDL.SDL_EventType.SDL_EVENT_USER) {
                     // SDL_QUIT is currently the only way to exit early (other that crashing)
-                    if (e.type is SDL.SDL_EventType.SDL_QUIT)
+                    if ((SDL.SDL_EventType) e.type is SDL.SDL_EventType.SDL_EVENT_QUIT)
                         earlyExit = true;
                     return; // quit asap
                 }
@@ -383,31 +386,31 @@ public class EverestSplashWindow {
             SDL.SDL_RenderClear(windowInfo.renderer);
 
             // BG bloom drawing
-            SDL.SDL_Rect bgRect = new() {
+            SDL.SDL_FRect bgRect = new() {
                 x = 0,
                 y = bgBloomPos,
                 w = WindowWidth,
                 h = realBgH, // We calculated this earlier for the animation
             };
-            SDL.SDL_RenderCopy(windowInfo.renderer, windowInfo.bgGradientTexture.Handle, IntPtr.Zero, ref bgRect);
+            SDL.SDL_RenderTexture(windowInfo.renderer, windowInfo.bgGradientTexture.Handle, ref Unsafe.NullRef<SDL.SDL_FRect>(), ref bgRect);
             // Draw another one above because it tiles nicely
             bgRect.y = bgBloomPos - bgRect.h;
-            SDL.SDL_RenderCopy(windowInfo.renderer, windowInfo.bgGradientTexture.Handle, IntPtr.Zero, ref bgRect);
+            SDL.SDL_RenderTexture(windowInfo.renderer, windowInfo.bgGradientTexture.Handle, ref Unsafe.NullRef<SDL.SDL_FRect>(), ref bgRect);
             // Finally, draw another one below the first one (mostly for 16:9 mode)
             bgRect.y = bgBloomPos + bgRect.h;
-            SDL.SDL_RenderCopy(windowInfo.renderer, windowInfo.bgGradientTexture.Handle, IntPtr.Zero, ref bgRect);
+            SDL.SDL_RenderTexture(windowInfo.renderer, windowInfo.bgGradientTexture.Handle, ref Unsafe.NullRef<SDL.SDL_FRect>(), ref bgRect);
 
 
             // Background wheel
             float scale = (float) WindowWidth / windowInfo.wheelTexture.Width;
-            SDL.SDL_Rect wheelRect = new() {
+            SDL.SDL_FRect wheelRect = new() {
                 x = (int)(-windowInfo.wheelTexture.Width*scale/2),
                 y = (int)(-windowInfo.wheelTexture.Height*scale/2),
                 w = (int)(windowInfo.wheelTexture.Width*scale),
                 h = (int)(windowInfo.wheelTexture.Height*scale),
             };
-            SDL.SDL_RenderCopyEx(windowInfo.renderer, windowInfo.wheelTexture.Handle, IntPtr.Zero,
-                ref wheelRect, wheelAngle, IntPtr.Zero, SDL.SDL_RendererFlip.SDL_FLIP_NONE);
+            SDL.SDL_RenderTextureRotated(windowInfo.renderer, windowInfo.wheelTexture.Handle, ref Unsafe.NullRef<SDL.SDL_FRect>(),
+                ref wheelRect, wheelAngle, ref Unsafe.NullRef<SDL.SDL_FPoint>(), SDL.SDL_FlipMode.SDL_FLIP_NONE);
 
 
             // Render one sprite
@@ -415,35 +418,35 @@ public class EverestSplashWindow {
             const int Tmargin = 32; // Top margin
             // Bottom margin is missing since that one is adjusted via window height
             int realWindowWidth = WindowWidth - LRmargin*2; // apply at both sides
-            SDL.SDL_Rect everestLogoRect = new() {
+            SDL.SDL_FRect everestLogoRect = new() {
                 x = LRmargin, // Add some margin
                 y = Tmargin,
                 w = realWindowWidth,
-                h = (int) ((float) realWindowWidth/windowInfo.everestLogoTexture.Width*windowInfo.everestLogoTexture.Height), // no need to subtract margin here since it ignores the height
+                h = ((float) realWindowWidth/windowInfo.everestLogoTexture.Width*windowInfo.everestLogoTexture.Height), // no need to subtract margin here since it ignores the height
             };
-            SDL.SDL_RenderCopy(windowInfo.renderer, windowInfo.everestLogoTexture.Handle, IntPtr.Zero, ref everestLogoRect);
+            SDL.SDL_RenderTexture(windowInfo.renderer, windowInfo.everestLogoTexture.Handle, ref Unsafe.NullRef<SDL.SDL_FRect>(), ref everestLogoRect);
 
 
             // Render the starting everest text
-            SDL.SDL_Point startingEverestPoint = new() {
+            SDL.SDL_FPoint startingEverestPoint = new() {
                 x = LRmargin,
                 y = Tmargin + (everestLogoRect.y + everestLogoRect.h),
             };
             windowInfo.startingEverestFontCache.Render(windowInfo.renderer, startingEverestPoint, 0.60F);
 
-            SDL.SDL_Point modLoadingProgressPoint = new() {
+            SDL.SDL_FPoint modLoadingProgressPoint = new() {
                 x = LRmargin+2, // Apparently this text looks misaligned compared to the above text, likely because of the change in font size, anyhow this lessens the effect
-                y = (int)(Tmargin + everestLogoRect.y + everestLogoRect.h +
+                y = (Tmargin + everestLogoRect.y + everestLogoRect.h +
                           windowInfo.startingEverestFontCache.GetCachedTextureSize().y * 0.60F),
             };
             windowInfo.modLoadingProgressCache.Render(windowInfo.renderer, modLoadingProgressPoint, 0.30F);
 
             // Render the loading progress bar
             const int barHeight = 4;
-            SDL.SDL_Rect progressRect = new() {
+            SDL.SDL_FRect progressRect = new() {
                 x = 0,
                 y = WindowHeight - barHeight,
-                w = (int) progressWidth,
+                w = progressWidth,
                 h = barHeight,
             };
             SDL.SDL_SetRenderDrawColor(windowInfo.renderer, 255, 255, 255, 255); // White
@@ -522,20 +525,6 @@ public class EverestSplashWindow {
         return currentAssembly.GetManifestResourceStream(embeddedResourcePath)
              ?? currentAssembly.GetManifestResourceStream(embeddedResourcePath.Replace('/', '\\'))
              ?? throw new FileNotFoundException($"Cannot find sprite with path as embeddedResource: {embeddedResourcePath}");
-    }
-
-    private int GetSDLRendererIdx() {
-        if (targetRenderer == "") // empty means any driver
-            return -1;
-        int renderDrivers = SDL.SDL_GetNumRenderDrivers();
-        for (int i = 0; i < renderDrivers; i++) {
-            SDL.SDL_GetRenderDriverInfo(i, out SDL.SDL_RendererInfo info);
-            if (Marshal.PtrToStringUTF8(info.name) == targetRenderer.ToLower()) {
-                return i;
-            }
-        }
-        Console.WriteLine($"Renderer target: {targetRenderer} not found or available");
-        return -1; // requested renderer is not available, use anything
     }
 
     private List<Timer> timers = new();

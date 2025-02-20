@@ -1,4 +1,4 @@
-using EverestSplash.SDL2;
+using EverestSplash.SDL3;
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -50,9 +50,9 @@ public struct SSurface {
 /// </summary>
 public class STexture : IDisposable {
     public IntPtr Handle { get; private set; }
-    public readonly int Width;
-    public readonly int Height;
-    public readonly uint Format;
+    public readonly float Width;
+    public readonly float Height;
+    public readonly long Format;
 
     /// <summary>
     /// Creates a new texture from a stream, uses FNA3D for image parsing
@@ -67,15 +67,16 @@ public class STexture : IDisposable {
             throw new Exception("Could not read stream!");
         
         // Convert it to a SDL stream
-        IntPtr surface = SDL.SDL_CreateRGBSurfaceFrom(pixels,
-            w, 
-            h, 
-            8 * 4 /* byte per 4 channels */, 
-            w * 4, 
-            0x000000FF, 
-            0x0000FF00,
-            0x00FF0000, 
-            0xFF000000);
+        IntPtr surface = SDL.SDL_CreateSurfaceFrom(w, h, SDL.SDL_PixelFormat.SDL_PIXELFORMAT_ARGB8888, pixels, w*4);
+        // IntPtr surface = SDL.SDL_CreateRGBSurfaceFrom(pixels,
+        //     w, 
+        //     h, 
+        //     8 * 4 /* byte per 4 channels */, 
+        //     w * 4, 
+        //     0x000000FF, 
+        //     0x0000FF00,
+        //     0x00FF0000, 
+        //     0xFF000000);
         if (surface == IntPtr.Zero) 
             throw new Exception("Could not create surface! " + SDL.SDL_GetError());
         
@@ -85,7 +86,7 @@ public class STexture : IDisposable {
             throw new Exception("Could not create texture from surface! " + SDL.SDL_GetError());
         
         // Data has been copied, so this can be freed
-        SDL.SDL_FreeSurface(surface);
+        SDL.SDL_DestroySurface(surface);
         
         // Freeing the above surface does not deallocate the pixel data
         EverestSplashWindow.FNA3D.FNA3D_Image_Free(pixels);
@@ -96,8 +97,15 @@ public class STexture : IDisposable {
 
     public STexture(IntPtr handle) {
         Handle = handle;
-        if (SDL.SDL_QueryTexture(Handle, out Format, out _, out Width, out Height) != 0)
-            throw new Exception("Cannot QueryTexture: " + SDL.SDL_GetError());
+        if (!SDL.SDL_GetTextureSize(Handle, out Width, out Height))
+            throw new Exception("Cannot query texture size: " + SDL.SDL_GetError());
+        uint props = SDL.SDL_GetTextureProperties(Handle);
+        if (props == 0)
+            throw new Exception("Cannot query texture props: " + SDL.SDL_GetError());
+        long val = SDL.SDL_GetNumberProperty(props, SDL.SDL_PROP_TEXTURE_FORMAT_NUMBER, 0);
+        if (val == 0)
+            throw new Exception("Cannot query texture format");
+        Format = val;
     }
 
 

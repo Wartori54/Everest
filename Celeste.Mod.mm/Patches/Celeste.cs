@@ -395,10 +395,10 @@ namespace MonoMod {
         public static void PatchCelesteMain(ILContext context, CustomAttribute attrib) {
             ILCursor cursor = new ILCursor(context);
             // TryGotoNext used because SDL_GetPlatform does not exist on XNA
-            if (cursor.TryGotoNext(instr => instr.MatchCall("SDL2.SDL", "SDL_GetPlatform"))) {
-                cursor.Next.OpCode = OpCodes.Ldstr;
-                cursor.Next.Operand = "Windows";
-            }
+            // if (cursor.TryGotoNext(instr => instr.MatchCall("SDL2.SDL", "SDL_GetPlatform"))) {
+            //     cursor.Next.OpCode = OpCodes.Ldstr;
+            //     cursor.Next.Operand = "Windows";
+            // }
 
             cursor.Index = 0;
 

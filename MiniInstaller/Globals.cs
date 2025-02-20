@@ -6,7 +6,7 @@ namespace MiniInstaller;
 
 public static class Globals {
     public static readonly ReadOnlyCollection<string> WindowsNativeLibFileNames = Array.AsReadOnly(new string[] {
-        "fmod.dll", "fmodstudio.dll", "CSteamworks.dll", "steam_api.dll", "FNA3D.dll", "SDL2.dll"
+        "fmod.dll", "fmodstudio.dll", "CSteamworks.dll", "steam_api.dll", "FNA3D.dll", "SDL3.dll"
     });
     
     public static readonly ReadOnlyCollection<string> EverestSystemLibs = Array.AsReadOnly(new string[] {
