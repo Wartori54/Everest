@@ -284,16 +284,12 @@ public class EverestSplashWindow {
         if (appIconPixels == IntPtr.Zero) 
             throw new Exception("Could not read stream!");
         
-        IntPtr appIconSurface = SDL.SDL_CreateSurfaceFrom(w, h, SDL.SDL_PixelFormat.SDL_PIXELFORMAT_ABGR8888, appIconPixels, w*4);
-        // IntPtr appIconSurface = SDL.SDL_CreateRGBSurfaceFrom(appIconPixels,
-        //     w, 
-        //     h, 
-        //     8 * 4 /* byte per 4 channels */, 
-        //     w * 4, 
-        //     0x000000FF, 
-        //     0x0000FF00,
-        //     0x00FF0000, 
-        //     0xFF000000);
+        IntPtr appIconSurface = SDL.SDL_CreateSurfaceFrom(
+            w, 
+            h, 
+            SDL.SDL_PixelFormat.SDL_PIXELFORMAT_ABGR8888, 
+            appIconPixels, 
+            w*4);
         if (appIconSurface == IntPtr.Zero) 
             throw new Exception("Could not create surface! " + SDL.SDL_GetError());
         SDL.SDL_SetWindowIcon(window, appIconSurface);

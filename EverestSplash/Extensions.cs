@@ -67,16 +67,12 @@ public class STexture : IDisposable {
             throw new Exception("Could not read stream!");
         
         // Convert it to a SDL stream
-        IntPtr surface = SDL.SDL_CreateSurfaceFrom(w, h, SDL.SDL_PixelFormat.SDL_PIXELFORMAT_ARGB8888, pixels, w*4);
-        // IntPtr surface = SDL.SDL_CreateRGBSurfaceFrom(pixels,
-        //     w, 
-        //     h, 
-        //     8 * 4 /* byte per 4 channels */, 
-        //     w * 4, 
-        //     0x000000FF, 
-        //     0x0000FF00,
-        //     0x00FF0000, 
-        //     0xFF000000);
+        IntPtr surface = SDL.SDL_CreateSurfaceFrom(
+            w, 
+            h, 
+            SDL.SDL_PixelFormat.SDL_PIXELFORMAT_ARGB8888, 
+            pixels, 
+            w*4);
         if (surface == IntPtr.Zero) 
             throw new Exception("Could not create surface! " + SDL.SDL_GetError());
         
