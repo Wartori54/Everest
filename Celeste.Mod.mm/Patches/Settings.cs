@@ -229,16 +229,11 @@ namespace MonoMod {
             FieldReference f_Binding_Mouse = il.Module.GetType("Monocle.Binding").FindField("Mouse");
             GenericInstanceType t_List_MouseButtons = (GenericInstanceType) il.Module.ImportReference(f_Binding_Mouse.FieldType);
             MethodReference m_temp = t_List_MouseButtons.Resolve().FindProperty("Count").GetMethod;
-            MethodReference m_List_MouseButtons_get_Count = il.Module.ImportReference(
-                new MethodReference(
-                    m_temp.Name,
-                    m_temp.ReturnType) {
-                    DeclaringType = t_List_MouseButtons,
-                    HasThis = m_temp.HasThis,
-                    ExplicitThis = m_temp.ExplicitThis,
-                    CallingConvention = m_temp.CallingConvention,
-                }
-            );
+            // m_temp lives in a standard library assembly, get a reference to it
+            MethodReference m_List_MouseButtons_get_Count = il.Module.ImportReference(m_temp);
+            // The reference is freshly created so we can mess with it
+            // Thus, attach it to a GenericInstanceType instead of the generic TypeReference
+            m_List_MouseButtons_get_Count.DeclaringType = t_List_MouseButtons;
 
             ILCursor c = new ILCursor(il);
             ILCursor c_Search = c.Clone();
