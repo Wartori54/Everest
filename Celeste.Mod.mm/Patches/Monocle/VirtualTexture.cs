@@ -425,11 +425,11 @@ namespace Monocle {
                 // Someone has the lock, and we are not going to block anyway, so return early
                 return;
             } 
-            if (FtlToggle && isPreloaded && !block && MainThreadHelper.IsMainThread) {
+            if (FtlToggle && isPreloaded && !block/* && MainThreadHelper.IsMainThread*/) {
                 // This is the main asynchronous FTL entry point
                 // isPreloaded is required to be true so we can have some knowledge of the memory usage of the load
                 Task.Run(() => {
-                    Reload(false, isLazy);
+                    Reload(true, isLazy);
                 });
                 // Since we are not blocking, we are free to return whenever we want
                 return;

@@ -1175,10 +1175,22 @@ namespace Celeste.Mod {
 
                 if (asset is patch_Atlas atlas) {
                     string reloadingText = Dialog.Language == null ? "" : Dialog.Clean(mapping.Children.Count == 0 ? "ASSETRELOADHELPER_RELOADINGTEXTURE" : "ASSETRELOADHELPER_RELOADINGTEXTURES");
-                    AssetReloadHelper.Do(load, $"{reloadingText} {Path.GetFileName(mapping.PathVirtual)}", () => {
-                        atlas.ResetCaches();
-                        atlas.Ingest(mapping);
-                    });
+                    if (patch_VirtualTexture.FtlToggle && load) {
+                        AssetReloadHelper.Do(true, $"{reloadingText} {Path.GetFileName(mapping.PathVirtual)}", () => {
+                            Task t = Task.Run(() => {
+                                atlas.ResetCaches();
+                                atlas.Ingest(mapping);
+                            });
+                            while (!t.IsCompleted) {
+                                MainThreadHelper.Instance.Update(null);
+                            }
+                        });
+                    } else {
+                        AssetReloadHelper.Do(load, $"{reloadingText} {Path.GetFileName(mapping.PathVirtual)}", () => {
+                            atlas.ResetCaches();
+                            atlas.Ingest(mapping);
+                        });
+                    }
 
                     // if the atlas is (or contains) an emoji, register it.
                     if (Emoji.IsInitialized()) {
