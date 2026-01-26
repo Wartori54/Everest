@@ -139,6 +139,11 @@ namespace Monocle {
         private Texture2D? Texture_Unsafe;
 
         /// <summary>
+        /// Warning this is not thread safe.
+        /// </summary>
+        public bool IsLoaded => Texture_Unsafe != null;
+
+        /// <summary>
         /// Returns the current texture, and forces a reload if necessary.
         /// </summary>
         /// <exception cref="AggregateException">Thrown if the reload happened asynchronously and there was an exception during it.</exception>
@@ -248,6 +253,7 @@ namespace Monocle {
         private bool _textureOverridden;
         // The reload version, used to track whether any more reloads (or texture overrides) happened in the meantime
         private ulong _reloadVersion;
+        private ManualResetEventSlim _reloadDoneEvent;
 
         // The main FTL toggle, see this class header for all the details
         public static bool FtlToggle { get; internal set; }
@@ -261,6 +267,7 @@ namespace Monocle {
             Name = path;
             _textureLock = new object();
             _reloadLock = new object();
+            _reloadDoneEvent = new ManualResetEventSlim(true);
             CtorLoad();
         }
 
@@ -276,6 +283,7 @@ namespace Monocle {
             this.color = color;
             _textureLock = new object();
             _reloadLock = new object();
+            _reloadDoneEvent = new ManualResetEventSlim(true);
             CtorLoad();
         }
 
@@ -287,11 +295,28 @@ namespace Monocle {
             Name = metadata.PathVirtual;
             _textureLock = new object();
             _reloadLock = new object();
+            _reloadDoneEvent = new ManualResetEventSlim(true);
             CtorLoad();
         }
+        
+        [MonoModConstructor]
+        internal patch_VirtualTexture(string name, int width, int height, Color color, bool lazyLoad) {
+            ArgumentOutOfRangeException.ThrowIfLessThan(width, 1, nameof(width));
+            ArgumentOutOfRangeException.ThrowIfLessThan(height, 1, nameof(height));
+            _textureKind = TextureKind.SizeDefined;
+            Name = name;
+            _width = width;
+            _height = height;
+            this.color = color;
+            _textureLock = new object();
+            _reloadLock = new object();
+            _reloadDoneEvent = new ManualResetEventSlim(true);
+            CtorLoad(lazyLoad);
+        }
+        
 
         // Extra setup common in all constructors
-        private void CtorLoad() {
+        private void CtorLoad(bool forceSkipLoad = false) {
             if (Everest.Flags.IsHeadless) {
                 bool preload = Preload();
                 Everest.Events.VirtualTexture.OnShouldForceLazyLoad((VirtualTexture) (object) this);
@@ -308,7 +333,7 @@ namespace Monocle {
                 return;
             }
             // Only skip reloads with lazyloading and successful preloads
-            if (!Preload() || (!Everest.Events.VirtualTexture.OnShouldForceLazyLoad((VirtualTexture) (object) this) && !CoreModule.Settings.LazyLoading))
+            if (!Preload() || (!Everest.Events.VirtualTexture.OnShouldForceLazyLoad((VirtualTexture) (object) this) && !CoreModule.Settings.LazyLoading && !forceSkipLoad))
                 Reload();
         }
 
@@ -440,13 +465,12 @@ namespace Monocle {
                 // Failing to acquire the lock does not guarantee a reload is going to happen since there are other acquires down below
                 if (!_reloadInProgress) goto retry;
                 if (block) {
-                    // There has to be a better way to do this
-                    Monitor.Enter(_reloadLock);
-                    Monitor.Exit(_reloadLock);
+                    BlockingWaitForReloadLock();
                 }
                 return;
             }
             _reloadInProgress = true;
+            _reloadDoneEvent.Reset();
             try {
                 if (isLazy)
                     Everest.Events.VirtualTexture.LazyLoad((VirtualTexture)(object)this);
@@ -458,6 +482,7 @@ namespace Monocle {
                 asyncFault = ex;
                 throw;
             } finally {
+                _reloadDoneEvent.Set();
                 _reloadInProgress = false;
                 Monitor.Exit(_reloadLock);
             }
@@ -513,6 +538,17 @@ namespace Monocle {
                 _textureOverridden = false;
                 reloadVersion = ++_reloadVersion;
                 return true;
+            }
+        }
+
+        private void BlockingWaitForReloadLock() {
+            if (!MainThreadHelper.IsMainThread) {
+                _reloadDoneEvent.Wait();
+                return;
+            }
+
+            while (!_reloadDoneEvent.IsSet) {
+                MainThreadHelper.Instance.Update(null);
             }
         }
 
@@ -662,17 +698,14 @@ namespace Monocle {
             }
 
             public static void ImmediateAssign(patch_VirtualTexture vtex, Texture2D tex, bool force, ulong reloadVersion) {
-                if (!force) {
-                    lock (vtex._textureLock) {
-                        if (vtex._textureOverridden) return;
-                        ImmediateAssign(vtex, tex, true, reloadVersion);
-                    }
+                lock (vtex._textureLock) {
+                    if (!force && vtex._textureOverridden) return;
+                    ArgumentNullException.ThrowIfNull(tex);
+                    if (vtex._reloadVersion != reloadVersion) return;
+                    vtex.Texture_Unsafe = tex;
+                    vtex._width = tex.Width;
+                    vtex._height = tex.Height;
                 }
-                ArgumentNullException.ThrowIfNull(tex);
-                if (vtex._reloadVersion != reloadVersion) return;
-                vtex.Texture_Unsafe = tex;
-                vtex._width = tex.Width;
-                vtex._height = tex.Height;
             }
         }
 
@@ -682,6 +715,8 @@ namespace Monocle {
             SizeDefined
         }
     }
+
+#nullable disable
     public static class VirtualTextureExt {
 
         /// <summary>
