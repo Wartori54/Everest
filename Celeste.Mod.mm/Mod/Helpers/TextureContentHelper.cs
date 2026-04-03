@@ -12,165 +12,68 @@ using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 
 #nullable enable
 
 namespace Celeste.Mod.Helpers;
 
-public static class TextureContentHelper {
-    [ThreadStatic]
-    private static byte[]? bytes;
-    private const int bytesSize = 512 * 1024; // 524288
-    private const int bytesCheckSize = 512 * 1024 - 32; // 524256
-    private const int atlasSize = 4096 * 4096 * 4;
-    // The maximum texture size in bytes that is allowed, currently this 512 mb which is still unreasonably
-    // high, not all loads check it's size because not all of them have a known size before it occurs
-    private const int maxCheckedTextureSize = atlasSize * 8;
-    internal static readonly FTLMemoryManager MemoryManager;
-    static TextureContentHelper() {
-        bool inGC;
-        if (CoreModule.Instance != null) {
-            // Prefer no gc if unset, should give better performance
-            inGC = CoreModule.Settings.FastTextureLoadingPoolUseGC ?? false;
-        } else {
-            inGC = false;
-            // Looking for a cleaner way, adding an Initialize method would make ugly the other methods and fields (need to check if init-ed on each call)
-            Logger.Error(nameof(TextureContentHelper), "Static constructor called too early! FastTextureLoadingPoolUseGC config could not be read in time!");
-        }
-        const int initialMemUsage = atlasSize * 4; // hardcoded for now, should be plenty to start and a good default
-        MemoryManager = new FTLMemoryManager(initialMemUsage, inGC);
+// TODO: Pooling
+public abstract class TextureLoader : IDisposable {
+    
+    public abstract void AsyncLoad(CancellationToken token);
+
+    public abstract Texture2D SyncLoad();
+
+    public virtual void Dispose() {
     }
 
-    public static bool TryEnableFTL() {
-        /* Vanilla calls GFX.Load and MTN.Load in LoadContent on non-Stadia platforms.
-         * Sadly we can't load them in GameLoader.LoadThread as mods rely on them in LoadContent.
-         *
-         * Loading in a new thread with texture -> GPU ops on the main thread helps barely.
-         * Spawning a new thread just to wait for it to end doesn't make much sense,
-         * BUT delaying the slow texture load ops to happen lazy-async gets the game window to appear sooner.
-         *
-         * Note that on XNA, this dies both with and without threaded GL due to OOM exceptions.
-         * -ade
-         */
-        if (patch_VirtualTexture.FtlToggle) return true;
-        if (CoreModule.Settings.FastTextureLoading ?? Environment.ProcessorCount >= 4) {
-            long limit = (long) (CoreModule.Settings.FastTextureLoadingMaxMB * 1024f * 1024f);
+    public interface IPreLoader {
+        // TODO Merge this two because being separate is useless
+        public bool CouldPreload { get; }
+        public Point GetPreloadedSize();
 
-            if (limit <= 0) {
-                limit = (long) (Everest.SystemMemoryMB * 0.2f * 1024f * 1024f);
-                // Assume that even in the worst case with 4 GB system RAM, 512 MB (= 12.5% = 1/8) are still available for texture loads.
-                if (limit <= (512L * 1024L * 1024L))
-                    limit = (512L * 1024L * 1024L);
-            }
-            // ... and even if the user forcibly lowered it below 128 MB, fall back to 128 MB as even the vanilla gameplay atlas is 64MB.
-            if (limit <= (128L * 1024L * 1024L))
-                limit = (128L * 1024L * 1024L);
-
-            Logger.Info("LoadContent", $"Enabling FTL with {limit} bytes");
-            patch_VirtualTexture.FtlToggle = true;
-            MemoryManager.SetAllocSize(limit);
-            return true;
-        }
-        return false;
+        public TextureLoader CreateLoader();
     }
-    
-    /// <summary>
-    /// Loads a texture from a filesystem path.
-    /// </summary>
-    /// <param name="path">The filesystem path.</param>
-    /// <param name="preW">The preloaded width.</param>
-    /// <param name="preH">The preloaded height.</param>
-    /// <returns>A delegate which instantiates and loads the data onto a Texture2D, and a delegate which does cleanup.</returns>
-    public static (Func<Texture2D>, Action?) LoadFromPath(string path, int preW = -1, int preH = -1) {
-        int w, h;
-        switch (Path.GetExtension(path)) {
-            case ".data":
-                bool hasSegment;
-                SpanPoolPool<byte>.SegmentIdentifier seg;
-                Memory<byte> mem;
-                using (FileStream stream = File.OpenRead(Path.Combine(Engine.ContentDirectory, path))) {
-                    
-                    // Vanilla has got a static readonly byte[] bytes of fixed length - currently 524288
-                    // Luckily we can read more chunks on demand.
-                    byte[] read = bytes ??= new byte[bytesSize];
+}
 
-                    _ = stream.Read(read, 0, bytesSize);
-    
-                    // Read the width, height and alpha mode
-                    w = BitConverter.ToInt32(read, 0);
-                    h = BitConverter.ToInt32(read, 4);
-                    bool hasAlpha = read[8] == 1;
-    
-                    int size = w * h * 4;
-                    {
-                        hasSegment = MemoryManager.GetChunkOrGcAlloc(size, out seg, out byte[] gcArray
-#if TRACE_GC_ALLOCS
-                            , $"Path texture {path}"
-#endif
-                        );
-                        mem = hasSegment ? seg.SegId.Memory : gcArray;
-                    }
+public abstract class FNAStreamTextureLoader : TextureLoader {
+    protected readonly Stream? _stream;
+    protected int preW;
+    protected int preH;
+    private readonly bool preMul;
+    private IntPtr dataPtr;
+    private long unmanagedClaimed;
 
-                    Span<byte> buffer = mem.Span;
-                    if (hasAlpha) {
-                        ReadDataFile<HasAlpha>(stream, read, buffer);
-                    } else {
-                        ReadDataFile<NoAlpha>(stream, read, buffer);
-                    }
-                }
-                return (() => {
-                    Texture2D tex = new(Celeste.Instance.GraphicsDevice, w, h);
-                    unsafe {
-                        fixed (byte* ptr = mem.Span)
-                            tex.SetData((IntPtr) ptr);
-                    }
-                    return tex;
-                },
-                () => {
-                    if (hasSegment)
-                        MemoryManager.ReturnChunk(seg);
-                });
-            case ".png":
-                return LoadFromStream(File.OpenRead(Path.Combine(Engine.ContentDirectory, path)), false /* pngs are never premultiplied */, preW, preH);
-            case ".xnb":
-                // xnbs are only really present in vanilla, not mods, so they are not really worth accelerating
-                return (() => Engine.Instance.Content.Load<Texture2D>(path.Replace(".xnb", "")), null);
-            default:
-                return (() => { 
-                    (Func<Texture2D> main, Action? cleanup) pair = LoadFromStream(File.OpenRead(Path.Combine(Engine.ContentDirectory, path)), false);
-                    Texture2D tex = pair.main();
-                    pair.cleanup?.Invoke();
-                    return tex;
-                }, null);
-        }
+
+    // Taking in a stream provider is not really necessary here, yet it helps encapsulation and there's no performance impact either
+    protected FNAStreamTextureLoader(Func<Stream> streamProvider, bool preMultiplied, int width = -1, int height = -1) {
+        _stream = streamProvider();
+        preW = width;
+        preH = height;
+        preMul = preMultiplied;
+        unmanagedClaimed = 0;
+        dataPtr = IntPtr.Zero;
     }
 
-    /// <summary>
-    /// Loads a texture from a stream.
-    /// </summary>
-    /// <param name="stream">The stream to read from.</param>
-    /// <param name="premul">Whether the texture data read from the stream is premultiplied.</param>
-    /// <param name="w">The preloaded width of the texture in the stream.</param>
-    /// <param name="h">The preloaded height of the texture in the stream.</param>
-    /// <returns>A delegate which instantiates and loads the data onto a Texture2D, and a delegate which does cleanup.</returns>
-    public static (Func<Texture2D>, Action?) LoadFromStream(Stream stream, bool premul, int w = -1, int h = -1) {
-        using (stream) {
+    public override void AsyncLoad(CancellationToken token) {
+        {
+            int w = preW;
+            int h = preH;
             // This code will ultimately use stb_image to decode whatever is in stream
             // we cannot control its allocation, so estimate it based on the image size
             // and some arbitrary inflation coefficient
             const double inflationCoef = 1.2;
-            long unmanagedClaimed = 0;
             if (w > 0 && h > 0) {
-                unmanagedClaimed = (long) ((double) w * h * 4 * inflationCoef);
+                unmanagedClaimed = (long) ((double) preW * preH * 4 * inflationCoef);
                 // ClaimUnmanaged gets us the amount that we managed to claim
-                unmanagedClaimed = MemoryManager.ClaimUnmanaged(unmanagedClaimed
+                unmanagedClaimed = TextureContentHelper.MemoryManager.ClaimUnmanaged(unmanagedClaimed
 #if TRACE_GC_ALLOCS
-                , $"Path texture {
-                    stream switch {
+                , $"Stream texture from path {
+                    stream switch { // Not all streams will have paths, but the vast majority do, so this is good enough for tracing
                         FileStream fs => fs.Name,
                         SynchronizedZipEntryStream szes => szes.entry.FullName,
                         _ => "Unknown path"
@@ -180,56 +83,181 @@ public static class TextureContentHelper {
                 );
             }
             // If we don't know the size beforehand VirtualTexture is in charge of not multithreading loads
-            IntPtr dataPtr; // assume Texture.SetData supports Ptr since we are using FNA
-            if (premul)
-                ContentExtensions.LoadTextureRaw(Celeste.Instance.GraphicsDevice, stream, out w, out h, out dataPtr);
+            // Assume Texture.SetData supports Ptr since we are using FNA
+            if (preMul)
+                ContentExtensions.LoadTextureRaw(Celeste.Instance.GraphicsDevice, _stream, out w, out h, out dataPtr);
             else
-                ContentExtensions.LoadTextureLazyPremultiply(Celeste.Instance.GraphicsDevice, stream, out w, out h, out dataPtr);
-            stream.Dispose();
-            return (() => {
-                Texture2D tex = new(Celeste.Instance.GraphicsDevice, w, h);
-                tex.SetData(dataPtr);
-                return tex;
-            }, () => {
-                ContentExtensions.UnloadTextureRaw(dataPtr);
-                if (unmanagedClaimed != 0)
-                    MemoryManager.ReturnUnmanaged(unmanagedClaimed);
-            });
+                ContentExtensions.LoadTextureLazyPremultiply(Celeste.Instance.GraphicsDevice, _stream, out w, out h, out dataPtr);
+            preW = w;
+            preH = h;
         }
     }
     
-    /// <summary>
-    /// Creates a texture from width, height and color.
-    /// </summary>
-    /// <param name="width"></param>
-    /// <param name="height"></param>
-    /// <param name="color"></param>
-    /// <returns>A delegate which instantiates and loads the data onto a Texture2D, and a delegate which does cleanup.</returns>
-    public static (Func<Texture2D>, Action?) LoadFromSizeAndColor(int width, int height, Color color) {
-        // Layout order for Color is unknown, but since it's guaranteed to be consistent everywhere this will work
-        bool hasSegment = MemoryManager.GetChunkOrGcAlloc(width*height*Unsafe.SizeOf<Color>(), 
-            out SpanPoolPool<byte>.SegmentIdentifier seg, out byte[] gcArray
-#if TRACE_GC_ALLOCS
-            , $"Sized texture {width}x{height}"
-#endif
-            );
-        Memory<byte> data = hasSegment ? seg.SegId.Memory : gcArray;
-        Span<Color> colorData = MemoryMarshal.Cast<byte, Color>(data.Span);
-        colorData.Fill(color);
-        return (() => {
-            Texture2D tex = new(Engine.Instance.GraphicsDevice, width, height);
-            unsafe {
-                fixed (byte* ptr = data.Span) {
-                    tex.SetData((IntPtr)ptr);
+    public override Texture2D SyncLoad() {
+        Texture2D tex = new(Celeste.Instance.GraphicsDevice, preW, preH);
+        tex.SetData(dataPtr);
+        return tex;
+    }
+    
+    public override void Dispose() {
+        ContentExtensions.UnloadTextureRaw(dataPtr);
+        if (unmanagedClaimed != 0)
+            TextureContentHelper.MemoryManager.ReturnUnmanaged(unmanagedClaimed);
+        _stream?.Dispose();
+    }
+}
+
+public sealed class PNGTextureLoader : FNAStreamTextureLoader {
+    private PNGTextureLoader(Func<Stream> streamProvider) : base(streamProvider, false /* pngs are never premultiplied */) {
+    }
+    
+    public class PNGPreLoader : IPreLoader {
+        public bool CouldPreload => preW != -1 && preH != -1;
+        private readonly Func<Stream> _streamProvider;
+        private readonly int preW = -1;
+        private readonly int preH = -1;
+
+        // We use stream providers because we open the stream multiple times
+        public PNGPreLoader(Func<Stream> streamProvider, string path, bool noPreload = false) {
+            _streamProvider = streamProvider;
+            if (!noPreload) {
+                bool preload = PreloadSizeFromPNG(streamProvider(), path, out int width, out int height);
+                if (preload) {
+                    preW = width;
+                    preH = height;
                 }
             }
-            return tex;
-        }, () => {
-            if (hasSegment)
-                MemoryManager.ReturnChunk(seg);
-        });
+        }
+        
+        public Point GetPreloadedSize() {
+            return new Point(preW, preH);
+        }
+        
+        public TextureLoader CreateLoader() {
+            return new PNGTextureLoader(_streamProvider);
+        }
+        
+        private static bool PreloadSizeFromPNG(Stream stream, string path, out int width, out int height) {
+            using BinaryReader reader = new(stream);
+            width = 0;
+            height = 0;
+            ulong magic = reader.ReadUInt64();
+            if (magic != 0x0A1A0A0D474E5089U) {
+                Logger.Error("vtex", $"Failed preloading PNG: Expected magic to be 0x0A1A0A0D474E5089, got 0x{magic.ToString("X16")} - {path}");
+                return false;
+            }
+            uint length = reader.ReadUInt32();
+            if (length != 0x0D000000U) {
+                Logger.Error("vtex", $"Failed preloading PNG: Expected first chunk length to be 0x0D000000, got 0x{length.ToString("X8")} - {path}");
+                return false;
+            }
+            uint chunk = reader.ReadUInt32();
+            if (chunk != 0x52444849U) {
+                Logger.Error("vtex", $"Failed preloading PNG: Expected IHDR marker 0x52444849, got 0x{chunk.ToString("X8")} - {path}");
+                return false;
+            }
+            width = SwapEndian(reader.ReadInt32());
+            height = SwapEndian(reader.ReadInt32());
+            return true;
+        }
+    
+        private static int SwapEndian(int data) {
+            return
+                ((data & 0xFF) << 24) |
+                (((data >> 8) & 0xFF) << 16) |
+                (((data >> 16) & 0xFF) << 8) |
+                ((data >> 24) & 0xFF);
+        }
+    }
+}
+
+public sealed class FallbackTextureLoader : FNAStreamTextureLoader {
+    public FallbackTextureLoader(Func<Stream> streamProvider, bool preMul) : base(streamProvider, preMul, -1, -1) {
     }
 
+    public class FallbackPreLoader(Func<Stream> streamProvider, bool preMul) : IPreLoader {
+        public bool CouldPreload => false;
+
+        public Point GetPreloadedSize() {
+            throw new InvalidOperationException();
+        }
+        public TextureLoader CreateLoader() {
+            return new FallbackTextureLoader(streamProvider, preMul);
+        }
+    }
+}
+
+public sealed class DataTextureLoader : TextureLoader {
+    [ThreadStatic]
+    private static byte[]? bytes;
+    private const int bytesSize = 512 * 1024; // 524288
+    private const int bytesCheckSize = 512 * 1024 - 32; // 524256
+    private Stream _stream;
+    private int w;
+    private int h;
+    private bool hasAlpha;
+    private Memory<byte> mem;
+    private TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier? segment;
+
+    private DataTextureLoader(Func<Stream> streamProvider) {
+        _stream = streamProvider();
+        w = 0;
+        h = 0;
+        mem = Memory<byte>.Empty;
+        segment = null;
+    }
+
+    // TODO: Use the token
+    public override void AsyncLoad(CancellationToken token) {
+        {
+            // Vanilla has got a static readonly byte[] bytes of fixed length - currently 524288
+            // Luckily we can read more chunks on demand.
+            byte[] read = bytes ??= new byte[bytesSize];
+            _ = _stream!.Read(read, 0, bytesSize);
+    
+            // Read the width, height and alpha mode
+            w = BitConverter.ToInt32(read, 0);
+            h = BitConverter.ToInt32(read, 4);
+            hasAlpha = read[8] == 1;
+            int size = w * h * 4;
+            bool hasSegment;
+            TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier seg;
+            {
+                hasSegment = TextureContentHelper.MemoryManager.GetChunkOrGcAlloc(size, out seg, out byte[] gcArray
+#if TRACE_GC_ALLOCS
+                            , $"Path texture {path}"
+#endif
+                );
+                mem = hasSegment ? seg.SegId.Memory : gcArray;
+            }
+
+            Span<byte> buffer = mem.Span;
+            if (hasAlpha) {
+                ReadDataFile<HasAlpha>(_stream, bytes!, buffer);
+            } else {
+                ReadDataFile<NoAlpha>(_stream, bytes!, buffer);
+            }
+            if (hasSegment)
+                segment = seg;
+        }
+    }
+    
+    public override Texture2D SyncLoad() {
+        Texture2D tex = new(Celeste.Instance.GraphicsDevice, w, h);
+        unsafe {
+            fixed (byte* ptr = mem.Span)
+                tex.SetData((IntPtr) ptr);
+        }
+        return tex;
+    }
+    
+    public override void Dispose() {
+        if (segment.HasValue)
+            TextureContentHelper.MemoryManager.ReturnChunk(segment.Value);
+        segment = null;
+        _stream.Dispose();
+    }
+    
     // Abuse generics in order to get dead code elimination for optimal code on both cases
     // This method simply reads from the `read` array and decodes to the `buffer` span,
     // It also expects `read` to be prefilled with the first part of `stream` and it 
@@ -310,14 +338,169 @@ public static class TextureContentHelper {
     }
 
     private struct NoAlpha : AlphaMode;
+    
+    public class DataPreLoader : IPreLoader {
+        private readonly Func<Stream> _streamProvider;
+        private readonly int preW;
+        private readonly int preH;
+        public bool CouldPreload => true;
+        
+        // We use stream providers because we open the stream multiple times
+        public DataPreLoader(Func<Stream> streamProvider) {
+            _streamProvider = streamProvider;
+            using Stream stream = _streamProvider();
+            Span<byte> read = stackalloc byte[8];
+            _ = stream!.Read(read);
+    
+            // Read the width, height and alpha mode
+            preW = BitConverter.ToInt32(read[0..]);
+            preH = BitConverter.ToInt32(read[4..]);
+        }
+        
+        public Point GetPreloadedSize() => new(preW, preH);
+        public TextureLoader CreateLoader() {
+            return new DataTextureLoader(_streamProvider);
+        }
+    }
+}
+
+public sealed class XnbTextureLoader : TextureLoader {
+    private string? _path;
+
+    private XnbTextureLoader(string path) {
+        _path = path;
+    }
+    
+    public override void AsyncLoad(CancellationToken token) {
+    }
+    
+    public override Texture2D SyncLoad() {
+        return Engine.Instance.Content.Load<Texture2D>(_path!.Replace(".xnb", ""));
+    }
+
+    public class XnbPreLoader(string path) : IPreLoader {
+        public bool CouldPreload => false; // Never accelerated
+
+        public Point GetPreloadedSize() {
+            throw new InvalidOperationException();
+        }
+        public TextureLoader CreateLoader() {
+            return new XnbTextureLoader(path);
+        }
+    }
+}
+
+public sealed class SizeDefinedTextureLoader : TextureLoader {
+    private int _width;
+    private int _height;
+    private Color _color;
+    private TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier? _segment;
+    private Memory<byte> _data;
+    private SizeDefinedTextureLoader(int width, int height, Color color) {
+        _width = width;
+        _height = height;
+        _color = color;
+        _segment = null;
+        _data = Memory<byte>.Empty;
+    }
+
+    // TODO: Use the token
+    public override void AsyncLoad(CancellationToken token) {
+        // Layout order for Color is unknown, but since it's guaranteed to be consistent everywhere this will work
+        bool hasSegment = TextureContentHelper.MemoryManager.GetChunkOrGcAlloc(_width * _height * Unsafe.SizeOf<Color>(),
+            out TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier seg, out byte[] gcArray
+    #if TRACE_GC_ALLOCS
+                , $"Sized texture {width}x{height}"
+    #endif
+        );
+        if (hasSegment)
+            _segment = seg;
+        _data = hasSegment ? seg.SegId.Memory : gcArray;
+        Span<Color> colorData = MemoryMarshal.Cast<byte, Color>(_data.Span);
+        colorData.Fill(_color);
+    }
+    
+    public override Texture2D SyncLoad() {
+        Texture2D tex = new(Engine.Instance.GraphicsDevice, _width, _height);
+        unsafe {
+            fixed (byte* ptr = _data.Span) {
+                tex.SetData((IntPtr) ptr);
+            }
+        }
+        return tex;
+    }
+    
+    public override void Dispose() {
+        if (_segment != null)
+            TextureContentHelper.MemoryManager.ReturnChunk(_segment.Value);
+        _segment = null;
+    }
+
+    public class SizeDefinedPreLoader(int width, int height, Color color) : IPreLoader {
+        public bool CouldPreload => true;
+        
+        public Point GetPreloadedSize() {
+            return new Point(width, height);
+        }
+        
+        public TextureLoader CreateLoader() {
+            return new SizeDefinedTextureLoader(width, height, color);
+        }
+    }
+}
+
+public static class TextureContentHelper {
+    private const int atlasSize = 4096 * 4096 * 4;
+    // The maximum texture size in bytes that is allowed, currently this 512 mb which is still unreasonably
+    // high, not all loads check its own size because not all of them have a known size before it occurs
+    private const int maxCheckedTextureSize = atlasSize * 8;
+    internal static readonly FTLMemoryManager MemoryManager;
+    
+    static TextureContentHelper() {
+        const int initialMemUsage = atlasSize * 4; // hardcoded for now, should be plenty to start and a good default
+        MemoryManager = new FTLMemoryManager(initialMemUsage);
+    }
+
+    public static bool TryEnableFTL() {
+        /* Vanilla calls GFX.Load and MTN.Load in LoadContent on non-Stadia platforms.
+         * Sadly we can't load them in GameLoader.LoadThread as mods rely on them in LoadContent.
+         *
+         * Loading in a new thread with texture -> GPU ops on the main thread helps barely.
+         * Spawning a new thread just to wait for it to end doesn't make much sense,
+         * BUT delaying the slow texture load ops to happen lazy-async gets the game window to appear sooner.
+         *
+         * Note that on XNA, this dies both with and without threaded GL due to OOM exceptions.
+         * -ade
+         */
+        if (patch_VirtualTexture.FtlToggle) return true;
+        if (CoreModule.Settings.FastTextureLoading ?? Environment.ProcessorCount >= 4) {
+            long limit = (long) (CoreModule.Settings.FastTextureLoadingMaxMB * 1024f * 1024f);
+
+            if (limit <= 0) {
+                limit = (long) (Everest.SystemMemoryMB * 0.2f * 1024f * 1024f);
+                // Assume that even in the worst case with 4 GB system RAM, 512 MB (= 12.5% = 1/8) are still available for texture loads.
+                if (limit <= (512L * 1024L * 1024L))
+                    limit = (512L * 1024L * 1024L);
+            }
+            // ... and even if the user forcibly lowered it below 128 MB, fall back to 128 MB as even the vanilla gameplay atlas is 64MB.
+            if (limit <= (128L * 1024L * 1024L))
+                limit = (128L * 1024L * 1024L);
+
+            Logger.Info("LoadContent", $"Enabling FTL with {limit} bytes");
+            patch_VirtualTexture.FtlToggle = true;
+            MemoryManager.SetAllocSize(limit);
+            return true;
+        }
+        return false;
+    }
+    
 
     /// <summary>
     /// Helper class to manage memory allocations and limit those.
     /// This class is thread-safe.
     /// </summary>
     /// <param name="initialMemUsage">Initial reserved memory usage.</param>
-    /// <param name="inGC">Whether the managed pool lives is a gc object or not.</param>
-    internal class FTLMemoryManager(long initialMemUsage, bool inGC) {
+    internal class FTLMemoryManager(long initialMemUsage) {
         private const double SplitPercent = 1 / 4D;
         private readonly long initialMemUsage = initialMemUsage;
         private const int MainThreadTimeout = 500;
@@ -325,7 +508,7 @@ public static class TextureContentHelper {
         private const int PoolSize = atlasSize;
         // Managed
         private readonly ResourceWaiter waitingForSpace = new(MainThreadTimeout, OtherThreadTimeout);
-        private readonly SpanPoolPool<byte> spanPool = new(PoolSize, (long)(initialMemUsage*SplitPercent), inGC);
+        private readonly SpanPoolPool<byte> spanPool = new(PoolSize, (long)(initialMemUsage*SplitPercent));
         
         // Unmanaged
         private long unmanagedMemoryUsage;
@@ -504,7 +687,6 @@ public static class TextureContentHelper {
         private readonly Dictionary<int, SpanPool<T>> pools = [];
         private int poolId;
         private long releasePending;
-        private readonly bool _inGC;
 
         public long CurrMemUsage {
             // ReSharper disable once InconsistentlySynchronizedField
@@ -517,10 +699,9 @@ public static class TextureContentHelper {
             }
         }
 
-        public SpanPoolPool(int poolSize, long initialMemUsage, bool gc) {
+        public SpanPoolPool(int poolSize, long initialMemUsage) {
             size = poolSize;
             currMemUsage = initialMemUsage;
-            _inGC = gc;
             CheckAlloc();
         }
 
@@ -530,7 +711,7 @@ public static class TextureContentHelper {
             long minPoolCount = currMemUsage / size + (currMemUsage % size != 0 ? 1 : 0);
             if (pools.Count < minPoolCount) {
                 for (int i = pools.Count; i < minPoolCount; i++) {
-                    pools.Add(poolId++, new SpanPool<T>(size, _inGC));
+                    pools.Add(poolId++, new SpanPool<T>(size));
                 }
             } else if (pools.Count > minPoolCount) {
                 int count = pools.Count;
@@ -616,47 +797,42 @@ public static class TextureContentHelper {
     /// <typeparam name="T"></typeparam>
     internal class SpanPool<T> : IDisposable where T : unmanaged {
         private readonly int size;
-        // private readonly object @lock = new();
 
-        private readonly ManagedOrNotArray<T> arrayHolder;
+        private readonly T[] arrayHolder;
         private readonly Memory<T> array;
         private readonly List<(int start, int end)> usedSegments = new();
         
-        public SpanPool(int itemCount, bool inGC) {
+        public SpanPool(int itemCount) {
             size = itemCount;
-            arrayHolder = new ManagedOrNotArray<T>(itemCount, inGC);
+            arrayHolder = new T[itemCount];
             array = arrayHolder.AsMemory();
         }
 
         public bool TryRent(int chunkSize, out SegmentIdentifier seg) {
-            // lock (@lock) {
-                (int start, int end)? freeSegment = NextFreeSegmentAndReserve(chunkSize);
-                if (!freeSegment.HasValue) { // No space
-                    seg = default;
-                    return false;
-                }
-                
-                // We have a spot
-                Memory<T> memory = array[freeSegment.Value.start..freeSegment.Value.end];
-                seg = new SegmentIdentifier(memory, freeSegment.Value.start, freeSegment.Value.end);
-                return true;
-            // }
+            (int start, int end)? freeSegment = NextFreeSegmentAndReserve(chunkSize);
+            if (!freeSegment.HasValue) { // No space
+                seg = default;
+                return false;
+            }
+            
+            // We have a spot
+            Memory<T> memory = array[freeSegment.Value.start..freeSegment.Value.end];
+            seg = new SegmentIdentifier(memory, freeSegment.Value.start, freeSegment.Value.end);
+            return true;
         }
 
         public void Return(SegmentIdentifier seg) {
-            // lock (@lock) {
-                // Find the matching segment and remove it
-                for (int i = 0; i < usedSegments.Count; i++) {
-                    if (seg.Start == usedSegments[i].start) {
-                        // Some extra verification to prevent corruption
-                        if (seg.End != usedSegments[i].end) {
-                            throw new ArgumentException("Invalid segment!");
-                        }
-                        usedSegments.RemoveAt(i);
-                        break;
+            // Find the matching segment and remove it
+            for (int i = 0; i < usedSegments.Count; i++) {
+                if (seg.Start == usedSegments[i].start) {
+                    // Some extra verification to prevent corruption
+                    if (seg.End != usedSegments[i].end) {
+                        throw new ArgumentException("Invalid segment!");
                     }
+                    usedSegments.RemoveAt(i);
+                    break;
                 }
-            // }
+            }
         }
         
         public bool IsEmpty() => usedSegments.Count == 0;
@@ -665,7 +841,6 @@ public static class TextureContentHelper {
             if (!IsEmpty()) {
                 throw new Exception("Attempted to deallocate with segments potentially in use!");
             }
-            arrayHolder.Dispose();
         }
 
         // Should always be called in a lock
@@ -701,67 +876,6 @@ public static class TextureContentHelper {
             public readonly Memory<T> Memory = memory;
             public readonly int Start = start;
             public readonly int End = end;
-        }
-    }
-
-    /// <summary>
-    /// Helper struct to abstract the logic behind having a managed array or an unmanaged array.
-    /// The arrays are used in the span pools.
-    /// </summary>
-    /// <typeparam name="T"></typeparam>
-    private readonly struct ManagedOrNotArray<T> : IDisposable where T : unmanaged {
-        private readonly bool Managed;
-        private readonly T[]? gcBuffer;
-        private readonly UnmanagedMemoryManager<T>? ptrBuffer;
-        
-        public ManagedOrNotArray(int itemCount, bool managed) {
-            Managed = managed;
-            if (managed) {
-                gcBuffer = new T[itemCount];
-            } else {
-                ptrBuffer = new UnmanagedMemoryManager<T>(itemCount);
-            }
-        }
-
-        public Memory<T> AsMemory() {
-            return Managed ? 
-                new Memory<T>(gcBuffer!) :
-                // Can't be null because Managed is false
-                ptrBuffer!.Memory;
-        }
-        
-        public void Dispose() {
-            ((IDisposable?)ptrBuffer)?.Dispose();
-        }
-    }
-
-    /// <summary>
-    /// A simple MemoryManager for unmanaged memory arrays.
-    /// </summary>
-    /// <param name="itemCount">Number of elements of the array.</param>
-    /// <typeparam name="T">Type of the array.</typeparam>
-    private sealed unsafe class UnmanagedMemoryManager<T>(int itemCount) : MemoryManager<T>
-        where T : unmanaged {
-        private readonly T* ptr = (T*)Marshal.AllocHGlobal(itemCount*Marshal.SizeOf<T>());
-        private bool disposed;
-
-        protected override void Dispose(bool disposing) {
-            if (disposed) throw new InvalidOperationException("Double free!");
-            Marshal.FreeHGlobal((IntPtr)ptr);
-            disposed = true;
-        }
-        
-        public override Span<T> GetSpan() {
-            return new Span<T>(ptr, itemCount);
-        }
-        
-        public override MemoryHandle Pin(int elementIndex = 0) {
-            // ptr won't ever move because it's not managed, so no pin needed.
-            return new MemoryHandle(ptr + elementIndex);
-        }
-        
-        public override void Unpin() {
-            // No work needed, pinning doesnt happen
         }
     }
 }

@@ -113,6 +113,22 @@ namespace Celeste.Mod {
             else
                 return new ValueTask<T>(TaskFactory.StartNew(act));
         }
+        
+        public static ValueTask<T> Schedule<T>(Func<T> act, CancellationToken ct, bool forceQueue = false) {
+            if (forceQueue && IsMainThread) {
+                try {
+                    TaskScheduler.TaskIsForceQueued = true;
+                    return new ValueTask<T>(TaskFactory.StartNew(act, ct));
+                } finally {
+                    TaskScheduler.TaskIsForceQueued = false;
+                }
+            }
+
+            if (IsMainThread)
+                return new ValueTask<T>(act());
+            else
+                return new ValueTask<T>(TaskFactory.StartNew(act, ct));
+        }
 
         public static Task Schedule(Func<Task> act, bool forceQueue = false) {
             if (forceQueue && IsMainThread) {

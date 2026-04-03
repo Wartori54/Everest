@@ -8,22 +8,33 @@ namespace Monocle {
         [MonoModIgnore]
         public string Name { get; internal set; }
         
-        // Making Width and Height virtual is a breaking change, so lets just add new virtual properties and make the
-        // old ones just wrap the new ones :)
-        protected virtual int InnerWidth { get; set; }
+        protected int _width;
         public int Width {
             [MonoModReplace]
-            get => InnerWidth;
+            get => _width;
             [MonoModReplace]
-            internal set => InnerWidth = value;
+            internal set {
+                if (_width != value) {
+                    _width = value;
+                    HandleSizeChange();
+                }
+            }
         }
-        
-        protected virtual int InnerHeight { get; set; }
-        public int Height { 
+
+        protected int _height;
+        public int Height {
             [MonoModReplace]
-            get => InnerHeight;
+            get => _height;
             [MonoModReplace]
-            internal set => InnerHeight = value;
+            internal set {
+                if (_height != value) {
+                    _height = value;
+                    HandleSizeChange();
+                }
+            }
+        }
+
+        protected virtual void HandleSizeChange() {
         }
         
 # pragma warning restore CS0108
