@@ -1,21 +1,20 @@
 // Log when last resort gc allocations happen to not lock the threads for too long
-//#define TRACE_GC_ALLOCS
+#define TRACE_GC_ALLOCS
 // Log the memory usage of the managed and unmanaged pools
-//#define POOL_USAGE_LOGGING
+#define POOL_USAGE_LOGGING
 
 using Celeste.Mod.Core;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Monocle;
 using System;
-using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
-using System.Threading.Tasks;
 
 #nullable enable
 
@@ -41,13 +40,12 @@ public abstract class TextureLoader : IDisposable {
 }
 
 public abstract class FNAStreamTextureLoader : TextureLoader {
-    protected readonly Stream? _stream;
-    protected int preW;
-    protected int preH;
+    private readonly Stream? _stream;
+    private int preW;
+    private int preH;
     private readonly bool preMul;
     private IntPtr dataPtr;
     private long unmanagedClaimed;
-
 
     // Taking in a stream provider is not really necessary here, yet it helps encapsulation and there's no performance impact either
     protected FNAStreamTextureLoader(Func<Stream> streamProvider, bool preMultiplied, int width = -1, int height = -1) {
@@ -60,37 +58,36 @@ public abstract class FNAStreamTextureLoader : TextureLoader {
     }
 
     public override void AsyncLoad(CancellationToken token) {
-        {
-            int w = preW;
-            int h = preH;
-            // This code will ultimately use stb_image to decode whatever is in stream
-            // we cannot control its allocation, so estimate it based on the image size
-            // and some arbitrary inflation coefficient
-            const double inflationCoef = 1.2;
-            if (w > 0 && h > 0) {
-                unmanagedClaimed = (long) ((double) preW * preH * 4 * inflationCoef);
-                // ClaimUnmanaged gets us the amount that we managed to claim
-                unmanagedClaimed = TextureContentHelper.MemoryManager.ClaimUnmanaged(unmanagedClaimed
+        int w = preW;
+        int h = preH;
+        // This code will ultimately use stb_image to decode whatever is in stream
+        // we cannot control its allocation, so estimate it based on the image size
+        // and some arbitrary inflation coefficient
+        const double inflationCoef = 1.2;
+        if (w > 0 && h > 0) {
+            unmanagedClaimed = (long) ((double) preW * preH * 4 * inflationCoef);
+            // ClaimUnmanaged gets us the amount that we managed to claim
+            unmanagedClaimed = TextureContentHelper.MemoryManager.ClaimUnmanaged(unmanagedClaimed
 #if TRACE_GC_ALLOCS
-                , $"Stream texture from path {
-                    stream switch { // Not all streams will have paths, but the vast majority do, so this is good enough for tracing
-                        FileStream fs => fs.Name,
-                        SynchronizedZipEntryStream szes => szes.entry.FullName,
-                        _ => "Unknown path"
-                    }
-                }"
+            , $"Stream texture from path {
+                _stream switch { // Not all streams will have paths, but the vast majority do, so this is good enough for tracing
+                    FileStream fs => fs.Name,
+                    SynchronizedZipEntryStream szes => szes.entry.FullName,
+                    _ => "Unknown path"
+                }
+            }"
 #endif
-                );
-            }
-            // If we don't know the size beforehand VirtualTexture is in charge of not multithreading loads
-            // Assume Texture.SetData supports Ptr since we are using FNA
-            if (preMul)
-                ContentExtensions.LoadTextureRaw(Celeste.Instance.GraphicsDevice, _stream, out w, out h, out dataPtr);
-            else
-                ContentExtensions.LoadTextureLazyPremultiply(Celeste.Instance.GraphicsDevice, _stream, out w, out h, out dataPtr);
-            preW = w;
-            preH = h;
+            );
         }
+        // If we don't know the size beforehand VirtualTexture is in charge of not multithreading loads
+        // Assume Texture.SetData supports Ptr since we are using FNA
+        if (preMul)
+            ContentExtensions.LoadTextureRaw(Celeste.Instance.GraphicsDevice, _stream, out w, out h, out dataPtr);
+        else
+            ContentExtensions.LoadTextureLazyPremultiply(Celeste.Instance.GraphicsDevice, _stream, out w, out h, out dataPtr);
+        preW = w;
+        preH = h;
+        token.ThrowIfCancellationRequested();
     }
     
     public override Texture2D SyncLoad() {
@@ -192,7 +189,7 @@ public sealed class DataTextureLoader : TextureLoader {
     private static byte[]? bytes;
     private const int bytesSize = 512 * 1024; // 524288
     private const int bytesCheckSize = 512 * 1024 - 32; // 524256
-    private Stream _stream;
+    private readonly Stream _stream;
     private int w;
     private int h;
     private bool hasAlpha;
@@ -209,37 +206,38 @@ public sealed class DataTextureLoader : TextureLoader {
 
     // TODO: Use the token
     public override void AsyncLoad(CancellationToken token) {
-        {
-            // Vanilla has got a static readonly byte[] bytes of fixed length - currently 524288
-            // Luckily we can read more chunks on demand.
-            byte[] read = bytes ??= new byte[bytesSize];
-            _ = _stream!.Read(read, 0, bytesSize);
-    
-            // Read the width, height and alpha mode
-            w = BitConverter.ToInt32(read, 0);
-            h = BitConverter.ToInt32(read, 4);
-            hasAlpha = read[8] == 1;
-            int size = w * h * 4;
-            bool hasSegment;
-            TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier seg;
-            {
-                hasSegment = TextureContentHelper.MemoryManager.GetChunkOrGcAlloc(size, out seg, out byte[] gcArray
-#if TRACE_GC_ALLOCS
-                            , $"Path texture {path}"
-#endif
-                );
-                mem = hasSegment ? seg.SegId.Memory : gcArray;
-            }
+        // Vanilla has got a static readonly byte[] bytes of fixed length - currently 524288
+        // Luckily we can read more chunks on demand.
+        byte[] read = bytes ??= new byte[bytesSize];
+        _ = _stream.Read(read, 0, bytesSize);
 
-            Span<byte> buffer = mem.Span;
-            if (hasAlpha) {
-                ReadDataFile<HasAlpha>(_stream, bytes!, buffer);
-            } else {
-                ReadDataFile<NoAlpha>(_stream, bytes!, buffer);
-            }
-            if (hasSegment)
-                segment = seg;
+        // Read the width, height and alpha mode
+        w = BitConverter.ToInt32(read, 0);
+        h = BitConverter.ToInt32(read, 4);
+        hasAlpha = read[8] == 1;
+        int size = w * h * 4;
+        bool hasSegment;
+        TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier seg;
+        {
+            hasSegment = TextureContentHelper.MemoryManager.GetChunkOrGcAlloc(size, out seg, out byte[] gcArray
+#if TRACE_GC_ALLOCS
+                        , $"Path texture {_stream switch {
+                            FileStream fs => fs.Name,
+                            _ => "Unknown path"
+                        }}"
+#endif
+            );
+            mem = hasSegment ? seg.SegId.Memory : gcArray;
         }
+
+        Span<byte> buffer = mem.Span;
+        if (hasAlpha) {
+            AsyncLoadInner<HasAlpha>(_stream, bytes, buffer);
+        } else {
+            AsyncLoadInner<NoAlpha>(_stream, bytes, buffer);
+        }
+        if (hasSegment)
+            segment = seg;
     }
     
     public override Texture2D SyncLoad() {
@@ -263,67 +261,65 @@ public sealed class DataTextureLoader : TextureLoader {
     // It also expects `read` to be prefilled with the first part of `stream` and it 
     // will keep reading from `stream` until all data is decoded.
     // Assumptions: read.Length >= bytesCheckSize, stream.Position == read.Length
-    [MethodImpl(MethodImplOptions.AggressiveInlining)] // This used to be inlined manually
-    private static unsafe void ReadDataFile<T>(Stream stream, byte[] read, Span<byte> buffer) where T : AlphaMode {
-        int size = buffer.Length;
-        fixed (byte* to = buffer)
-        fixed (byte* from = read) {
-            int* toI = (int*) to;
-            uint toIdxB = 0;
-            uint toIdxI = 0;
-            int readIdx = 9; // the first 9 bytes describe width, height and alpha mode (4+4+1), those have been read already
-            while (toIdxB < size) {
-                // Pixel values are run length encoded, this counts the number of pixels in this line
-                uint lineSize = from[readIdx];
+    // TODO: This has too many range checks
+    private static void AsyncLoadInner<T>(Stream stream, byte[] read, Span<byte> to) where T : AlphaMode {
+        Span<byte> from = read;
+        Span<int> toI = MemoryMarshal.Cast<byte, int>(to);
+        int size = to.Length;
+        int toIdxB = 0;
+        int toIdxI = 0;
+        int readIdx = 9; // the first 9 bytes describe width, height and alpha mode (4+4+1), those have been read already
+        while (toIdxB < size && toIdxI < toI.Length) { // The second check is unnecessary, it tries to help the jit remove bounds checks
+            // Pixel values are run length encoded, this counts the number of pixels in this line
+            uint lineSize = from[readIdx];
 
-                bool zeroSplat = false;
-                if (typeof(T) == typeof(HasAlpha)) {
-                    // If there is a nonzero alpha, all 4 bytes are stored, if alpha is zero, a single byte is
-                    byte a = from[readIdx + 1];
-                    if (a > 0) {
-                        to[toIdxB] = from[readIdx + 4];
-                        to[toIdxB + 1] = from[readIdx + 3];
-                        to[toIdxB + 2] = from[readIdx + 2];
-                        to[toIdxB + 3] = a;
-                        readIdx += 1 + 4;
-                    } else {
-                        toI[toIdxI] = 0;
-                        readIdx += 1 + 1;
-                        zeroSplat = true;
-                    }
+            bool zeroSplat = false;
+            if (typeof(T) == typeof(HasAlpha)) {
+                // If there is a nonzero alpha, all 4 bytes are stored, if alpha is zero, a single byte is
+                byte a = from[readIdx + 1];
+                if (a > 0) {
+                    to[toIdxB] = from[readIdx + 4];
+                    to[toIdxB + 1] = from[readIdx + 3];
+                    to[toIdxB + 2] = from[readIdx + 2];
+                    to[toIdxB + 3] = a;
+                    readIdx += 1 + 4;
                 } else {
-                    to[toIdxB] = from[readIdx + 3];
-                    to[toIdxB + 1] = from[readIdx + 2];
-                    to[toIdxB + 2] = from[readIdx + 1];
-                    to[toIdxB + 3] = 255;
-                    readIdx += 4;
+                    toI[toIdxI] = 0;
+                    readIdx += 1 + 1;
+                    zeroSplat = true;
                 }
+            } else {
+                to[toIdxB] = from[readIdx + 3];
+                to[toIdxB + 1] = from[readIdx + 2];
+                to[toIdxB + 2] = from[readIdx + 1];
+                to[toIdxB + 3] = 255;
+                readIdx += 4;
+            }
 
-                if (lineSize > 1) {
-                    if (typeof(T) == typeof(HasAlpha) && zeroSplat) {
-                        // If alpha was zero, bulk write 0 to the whole line
-                        Unsafe.InitBlockUnaligned(to + toIdxB + 4, 0, lineSize * 4 - 4);
-                    } else {
-                        // Write via integers for performance
-                        int splatValue = toI[toIdxI];
-                        for (uint jI = toIdxI + 1, end = toIdxI + lineSize; jI < end; jI++)
-                            toI[jI] = splatValue;
-                    }
+            if (lineSize > 1) {
+                if (typeof(T) == typeof(HasAlpha) && zeroSplat) {
+                    // If alpha was zero, bulk write 0 to the whole line
+                    Unsafe.InitBlockUnaligned(ref to[toIdxB + 4], 0, lineSize * 4 - 4);
+                } else {
+                    // Write via integers for performance
+                    int splatValue = toI[toIdxI];
+                    for (int jI = toIdxI + 1, end = toIdxI + (int)lineSize; jI < end; jI++)
+                        toI[jI] = splatValue;
                 }
+            }
 
-                // Advance
-                toIdxI += lineSize;
-                toIdxB = toIdxI * 4;
+            // Advance
+            toIdxI += (int)lineSize;
+            toIdxB = toIdxI * 4;
 
-                // If there is less than 32 bytes left, copy the remaining ones to the beginning and read from the stream again
-                if (readIdx > bytesCheckSize) {
-                    int offset = read.Length - readIdx;
-                    for (int oB = 0; oB < offset; oB++) {
-                        from[oB] = from[readIdx + oB];
-                    }
-                    _ = stream.Read(read, offset, read.Length - offset);
-                    readIdx = 0;
+            // If there is less than 32 bytes left, copy the remaining ones to the beginning and read from the stream again
+            if (readIdx > bytesCheckSize) {
+                int offset = read.Length - readIdx;
+                for (int oB = 0; oB < offset; oB++) {
+                    from[oB] = from[readIdx + oB];
                 }
+                _ = stream.Read(read, offset, read.Length - offset);
+                readIdx = 0;
             }
         }
     }
@@ -350,9 +346,9 @@ public sealed class DataTextureLoader : TextureLoader {
             _streamProvider = streamProvider;
             using Stream stream = _streamProvider();
             Span<byte> read = stackalloc byte[8];
-            _ = stream!.Read(read);
+            _ = stream.Read(read);
     
-            // Read the width, height and alpha mode
+            // Read the width and height
             preW = BitConverter.ToInt32(read[0..]);
             preH = BitConverter.ToInt32(read[4..]);
         }
@@ -365,7 +361,7 @@ public sealed class DataTextureLoader : TextureLoader {
 }
 
 public sealed class XnbTextureLoader : TextureLoader {
-    private string? _path;
+    private readonly string? _path;
 
     private XnbTextureLoader(string path) {
         _path = path;
@@ -391,9 +387,9 @@ public sealed class XnbTextureLoader : TextureLoader {
 }
 
 public sealed class SizeDefinedTextureLoader : TextureLoader {
-    private int _width;
-    private int _height;
-    private Color _color;
+    private readonly int _width;
+    private readonly int _height;
+    private readonly Color _color;
     private TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier? _segment;
     private Memory<byte> _data;
     private SizeDefinedTextureLoader(int width, int height, Color color) {
@@ -410,7 +406,7 @@ public sealed class SizeDefinedTextureLoader : TextureLoader {
         bool hasSegment = TextureContentHelper.MemoryManager.GetChunkOrGcAlloc(_width * _height * Unsafe.SizeOf<Color>(),
             out TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier seg, out byte[] gcArray
     #if TRACE_GC_ALLOCS
-                , $"Sized texture {width}x{height}"
+                , $"Sized texture {_width}x{_height}"
     #endif
         );
         if (hasSegment)
@@ -418,6 +414,7 @@ public sealed class SizeDefinedTextureLoader : TextureLoader {
         _data = hasSegment ? seg.SegId.Memory : gcArray;
         Span<Color> colorData = MemoryMarshal.Cast<byte, Color>(_data.Span);
         colorData.Fill(_color);
+        token.ThrowIfCancellationRequested();
     }
     
     public override Texture2D SyncLoad() {
@@ -798,14 +795,13 @@ public static class TextureContentHelper {
     internal class SpanPool<T> : IDisposable where T : unmanaged {
         private readonly int size;
 
-        private readonly T[] arrayHolder;
         private readonly Memory<T> array;
         private readonly List<(int start, int end)> usedSegments = new();
         
         public SpanPool(int itemCount) {
             size = itemCount;
-            arrayHolder = new T[itemCount];
-            array = arrayHolder.AsMemory();
+            T[] arrayHolder1 = new T[itemCount];
+            array = arrayHolder1.AsMemory();
         }
 
         public bool TryRent(int chunkSize, out SegmentIdentifier seg) {
