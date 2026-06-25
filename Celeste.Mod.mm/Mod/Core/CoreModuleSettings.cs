@@ -185,11 +185,6 @@ namespace Celeste.Mod.Core {
         [SettingNeedsRelaunch]
         [SettingInGame(false)]
         [SettingIgnore] // TODO: Show as advanced setting.
-        public bool? FastTextureLoadingPoolUseGC { get; set; } = null;
-
-        [SettingNeedsRelaunch]
-        [SettingInGame(false)]
-        [SettingIgnore] // TODO: Show as advanced setting.
         public bool UnpackFMODBanks { get; set; } = true;
 
         [SettingNeedsRelaunch]

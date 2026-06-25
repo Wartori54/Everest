@@ -16,13 +16,24 @@ namespace Celeste.Mod {
 
             public bool TaskIsForceQueued;
 
-            private readonly ConcurrentQueue<Task> _TasksQueue = new ConcurrentQueue<Task>();
+            private readonly LinkedList<Task> _TasksList = new();
             private readonly Stopwatch _Stopwatch = new Stopwatch();
 
             public override int MaximumConcurrencyLevel => 1;
 
-            protected override IEnumerable<Task> GetScheduledTasks() => _TasksQueue;
-            protected override void QueueTask(Task task) => _TasksQueue.Enqueue(task);
+            protected override IEnumerable<Task> GetScheduledTasks() {
+                //lock (_TasksList)
+                // ReSharper disable once InconsistentlySynchronizedField
+                return _TasksList;
+            }
+            protected override void QueueTask(Task task) {
+                lock (_TasksList) 
+                    _TasksList.AddLast(task);
+            }
+
+            protected override bool TryDequeue(Task task) {
+                return false;
+            }
 
             protected override bool TryExecuteTaskInline(Task task, bool taskWasPreviouslyQueued) {
                 // We must be on the main thread
@@ -34,26 +45,53 @@ namespace Celeste.Mod {
                 if (TaskIsForceQueued)
                     return false;
 
+                if (taskWasPreviouslyQueued) {
+                    lock (_TasksList)
+                        _TasksList.Remove(task);
+                }
+
                 return TryExecuteTask(task);
             }
 
             public void ExecuteTasksFor(int timeSlice) {
-                if (_TasksQueue.Count <= 0)
-                    return;
-
                 // Execute tasks during our allocated time slice
-                _Stopwatch.Restart();
-                while (_Stopwatch.ElapsedMilliseconds < timeSlice) {
-                    if (!_TasksQueue.TryDequeue(out Task task))
-                        break;
+                // Always execute a task at least
+                if (timeSlice > 0)
+                    _Stopwatch.Restart();
+                do {
+                    Task task;
+                    lock (_TasksList) {
+                        LinkedListNode<Task> node = _TasksList.First;
+                        if (node == null) break;
+                        task = node.Value;
+                        _TasksList.RemoveFirst();
+                    }
                     TryExecuteTask(task);
+                } while (_Stopwatch.ElapsedMilliseconds < timeSlice);
+                if (timeSlice > 0)
+                    _Stopwatch.Stop();
+            }
+
+            // Should always be invoked from main thread
+            public bool TryRunTaskNow(Task task) {
+                Debug.Assert(IsMainThread);
+                LinkedListNode<Task> node;
+                lock (_TasksList) {
+                    node = _TasksList.Find(task);
+                    if (node == null) return false;
                 }
-                _Stopwatch.Stop();
+                
+                TryExecuteTask(task);
+                
+                lock (_TasksList) {
+                    _TasksList.Remove(node);
+                }
+                return true;
             }
 
         }
 
-        public static MainThreadHelper Instance;
+        internal static MainThreadHelper Instance;
 
         public static Thread MainThread { get; private set; }
         public static bool UpdatedOnce { get; private set; }
@@ -160,6 +198,32 @@ namespace Celeste.Mod {
                 return act();
             else
                 return TaskFactory.StartNew(act).Unwrap();
+        }
+
+        // Waits for a task to complete while using the downtime to run MTH tasks
+        public static void BusyWaitTask(Task task) {
+            if (task.IsCompleted) return;
+            if (!IsMainThread) {
+                task.Wait();
+                return;
+            }
+
+            if (TaskScheduler.TryRunTaskNow(task)) {
+                return;
+            }
+            
+            while (!task.IsCompleted) {
+                TaskScheduler.ExecuteTasksFor(0);
+            }
+        }
+
+        // Waits for a task to complete while using the downtime to run MTH tasks
+        public static T BusyWaitTask<T>(Task<T> task) {
+            BusyWaitTask((Task)task);
+            if (task.IsCompleted)
+                return task.Result;
+            else
+                throw new InvalidOperationException("Recursive call to BusyWaitTask!");
         }
 
         public static readonly YieldFrameAwaitable YieldFrame;

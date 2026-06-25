@@ -348,7 +348,6 @@ https://discord.gg/6qjaePQ");
         }
 
         protected override void BeginRun() {
-            TextureContentHelper.MemoryManager.SetAllocSize(-1);
             base.BeginRun();
             // This is as close as we can get to the showwindow call
             EverestSplashHandler.StopSplash();

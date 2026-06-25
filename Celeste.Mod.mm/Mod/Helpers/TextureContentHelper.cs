@@ -1,20 +1,21 @@
 // Log when last resort gc allocations happen to not lock the threads for too long
-#define TRACE_GC_ALLOCS
+//#define TRACE_GC_ALLOCS
 // Log the memory usage of the managed and unmanaged pools
-#define POOL_USAGE_LOGGING
+//#define POOL_USAGE_LOGGING
 
 using Celeste.Mod.Core;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Monocle;
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 
 #nullable enable
 
@@ -23,17 +24,20 @@ namespace Celeste.Mod.Helpers;
 // TODO: Pooling
 public abstract class TextureLoader : IDisposable {
     
-    public abstract void AsyncLoad(CancellationToken token);
+    public abstract Task ProcessDataAndPrepareUpload(CancellationToken token);
 
-    public abstract Texture2D SyncLoad();
+    public abstract Texture2D UploadTexture();
 
-    public virtual void Dispose() {
+    public void Dispose() {
+        Dispose(true);
+        GC.SuppressFinalize(this);
     }
 
+    protected virtual void Dispose(bool disposing) {
+    }
+    
     public interface IPreLoader {
-        // TODO Merge this two because being separate is useless
-        public bool CouldPreload { get; }
-        public Point GetPreloadedSize();
+        public Point? GetPreloadedSize();
 
         public TextureLoader CreateLoader();
     }
@@ -46,6 +50,7 @@ public abstract class FNAStreamTextureLoader : TextureLoader {
     private readonly bool preMul;
     private IntPtr dataPtr;
     private long unmanagedClaimed;
+    private bool isDisposed;
 
     // Taking in a stream provider is not really necessary here, yet it helps encapsulation and there's no performance impact either
     protected FNAStreamTextureLoader(Func<Stream> streamProvider, bool preMultiplied, int width = -1, int height = -1) {
@@ -57,7 +62,7 @@ public abstract class FNAStreamTextureLoader : TextureLoader {
         dataPtr = IntPtr.Zero;
     }
 
-    public override void AsyncLoad(CancellationToken token) {
+    public override Task ProcessDataAndPrepareUpload(CancellationToken token) {
         int w = preW;
         int h = preH;
         // This code will ultimately use stb_image to decode whatever is in stream
@@ -65,7 +70,7 @@ public abstract class FNAStreamTextureLoader : TextureLoader {
         // and some arbitrary inflation coefficient
         const double inflationCoef = 1.2;
         if (w > 0 && h > 0) {
-            unmanagedClaimed = (long) ((double) preW * preH * 4 * inflationCoef);
+            unmanagedClaimed = (long) ((double) w * h * 4 * inflationCoef);
             // ClaimUnmanaged gets us the amount that we managed to claim
             unmanagedClaimed = TextureContentHelper.MemoryManager.ClaimUnmanaged(unmanagedClaimed
 #if TRACE_GC_ALLOCS
@@ -79,28 +84,37 @@ public abstract class FNAStreamTextureLoader : TextureLoader {
 #endif
             );
         }
-        // If we don't know the size beforehand VirtualTexture is in charge of not multithreading loads
         // Assume Texture.SetData supports Ptr since we are using FNA
         if (preMul)
-            ContentExtensions.LoadTextureRaw(Celeste.Instance.GraphicsDevice, _stream, out w, out h, out dataPtr);
+            ContentExtensions.LoadTextureRaw(ContentExtensions.GetGraphicsDevice(), _stream, out w, out h, out dataPtr);
         else
-            ContentExtensions.LoadTextureLazyPremultiply(Celeste.Instance.GraphicsDevice, _stream, out w, out h, out dataPtr);
+            ContentExtensions.LoadTextureLazyPremultiply(ContentExtensions.GetGraphicsDevice(), _stream, out w, out h, out dataPtr);
         preW = w;
         preH = h;
         token.ThrowIfCancellationRequested();
+        return Task.CompletedTask;
     }
     
-    public override Texture2D SyncLoad() {
-        Texture2D tex = new(Celeste.Instance.GraphicsDevice, preW, preH);
-        tex.SetData(dataPtr);
-        return tex;
+    public override Texture2D UploadTexture() {
+        return ContentExtensions.TextureFromPointer(ContentExtensions.GetGraphicsDevice(), preW, preH, dataPtr);
     }
     
-    public override void Dispose() {
-        ContentExtensions.UnloadTextureRaw(dataPtr);
+    protected override void Dispose(bool disposing) {
+        if (isDisposed) return;
+        if (disposing) {
+            _stream?.Dispose();
+        }
+        if (dataPtr != IntPtr.Zero) 
+            ContentExtensions.UnloadTextureRaw(dataPtr);
+        dataPtr = IntPtr.Zero;
         if (unmanagedClaimed != 0)
             TextureContentHelper.MemoryManager.ReturnUnmanaged(unmanagedClaimed);
-        _stream?.Dispose();
+        unmanagedClaimed = 0;
+        isDisposed = true;
+    }
+
+    ~FNAStreamTextureLoader() {
+        Dispose(false);
     }
 }
 
@@ -109,7 +123,6 @@ public sealed class PNGTextureLoader : FNAStreamTextureLoader {
     }
     
     public class PNGPreLoader : IPreLoader {
-        public bool CouldPreload => preW != -1 && preH != -1;
         private readonly Func<Stream> _streamProvider;
         private readonly int preW = -1;
         private readonly int preH = -1;
@@ -117,17 +130,15 @@ public sealed class PNGTextureLoader : FNAStreamTextureLoader {
         // We use stream providers because we open the stream multiple times
         public PNGPreLoader(Func<Stream> streamProvider, string path, bool noPreload = false) {
             _streamProvider = streamProvider;
-            if (!noPreload) {
-                bool preload = PreloadSizeFromPNG(streamProvider(), path, out int width, out int height);
-                if (preload) {
-                    preW = width;
-                    preH = height;
-                }
-            }
+            if (noPreload) return;
+            bool preload = PreloadSizeFromPNG(streamProvider(), path, out int width, out int height);
+            if (!preload) return;
+            preW = width;
+            preH = height;
         }
         
-        public Point GetPreloadedSize() {
-            return new Point(preW, preH);
+        public Point? GetPreloadedSize() {
+            return preW != -1 && preH != -1 ? new Point(preW, preH) : null;
         }
         
         public TextureLoader CreateLoader() {
@@ -169,15 +180,14 @@ public sealed class PNGTextureLoader : FNAStreamTextureLoader {
 }
 
 public sealed class FallbackTextureLoader : FNAStreamTextureLoader {
-    public FallbackTextureLoader(Func<Stream> streamProvider, bool preMul) : base(streamProvider, preMul, -1, -1) {
+    private FallbackTextureLoader(Func<Stream> streamProvider, bool preMul) : base(streamProvider, preMul) {
     }
 
     public class FallbackPreLoader(Func<Stream> streamProvider, bool preMul) : IPreLoader {
-        public bool CouldPreload => false;
-
-        public Point GetPreloadedSize() {
-            throw new InvalidOperationException();
+        public Point? GetPreloadedSize() {
+            return null;
         }
+        
         public TextureLoader CreateLoader() {
             return new FallbackTextureLoader(streamProvider, preMul);
         }
@@ -188,72 +198,133 @@ public sealed class DataTextureLoader : TextureLoader {
     [ThreadStatic]
     private static byte[]? bytes;
     private const int bytesSize = 512 * 1024; // 524288
-    private const int bytesCheckSize = 512 * 1024 - 32; // 524256
+    private const int refillBufferMargin = 32; // 524256
+    private const int bytesCheckSize = 512 * 1024 - refillBufferMargin; // 524256
     private readonly Stream _stream;
     private int w;
     private int h;
     private bool hasAlpha;
     private Memory<byte> mem;
-    private TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier? segment;
+    private IMemoryOwner<byte>? memOwner;
+    //private TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier? segment;
+    private bool isDisposed;
 
     private DataTextureLoader(Func<Stream> streamProvider) {
         _stream = streamProvider();
         w = 0;
         h = 0;
         mem = Memory<byte>.Empty;
-        segment = null;
+        //segment = null;
+    }
+    
+    public Task ProcessDataAndPrepareUpload1(CancellationToken token) {
+        // Vanilla has got a static readonly byte[] bytes of fixed length - currently 524288
+        // Luckily we can read more chunks on demand.
+        byte[] readArray = bytes ??= new byte[bytesSize];
+        // using IMemoryOwner<byte> readOwner = await TextureContentHelper.MemoryManager2.Rent(bytesSize+9);
+        // Memory<byte> read = readOwner.Memory[..(bytesSize+9)];
+        Span<byte> read = readArray.AsSpan();
+        _ = _stream.Read(read);
+
+        // Read the width, height and alpha mode
+        w = BitConverter.ToInt32(read);
+        h = BitConverter.ToInt32(read[4..]);
+        hasAlpha = read[8] == 1;
+        int size = w * h * 4;
+//         bool hasSegment;
+//         TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier seg;
+//         {
+//             hasSegment = TextureContentHelper.MemoryManager.GetChunkOrGcAlloc(size, out seg, out byte[] gcArray
+// #if TRACE_GC_ALLOCS
+//                         , $"Path texture {_stream switch {
+//                             FileStream fs => fs.Name,
+//                             _ => "Unknown path"
+//                         }}"
+// #endif
+//             );
+//             mem = hasSegment ? seg.SegId.Memory : gcArray;
+//         }
+        memOwner = TextureContentHelper.MemoryManager2.Rent(size).Result;
+        mem = memOwner.Memory[..size];
+        // the first 9 bytes describe width, height and alpha mode (4+4+1), those have been read already
+        if (hasAlpha) {
+            // await AsyncLoadInner2<HasAlpha>(_stream, read[9..], mem);
+            AsyncLoadInner1<HasAlpha>(_stream, read, mem.Span);
+        } else {
+            // await AsyncLoadInner2<NoAlpha>(_stream, read[9..], mem);
+            AsyncLoadInner1<NoAlpha>(_stream, read, mem.Span);
+        }
+        
+        // if (hasSegment)
+        //     segment = seg;
+        return Task.CompletedTask;
     }
 
     // TODO: Use the token
-    public override void AsyncLoad(CancellationToken token) {
+    public override async Task ProcessDataAndPrepareUpload(CancellationToken token) {
         // Vanilla has got a static readonly byte[] bytes of fixed length - currently 524288
         // Luckily we can read more chunks on demand.
-        byte[] read = bytes ??= new byte[bytesSize];
-        _ = _stream.Read(read, 0, bytesSize);
+        byte[] readArray = bytes ??= new byte[bytesSize];
+        // using IMemoryOwner<byte> readOwner = await TextureContentHelper.MemoryManager2.Rent(bytesSize+9);
+        // Memory<byte> read = readOwner.Memory[..(bytesSize+9)];
+        Memory<byte> read = readArray.AsMemory();
+        _ = await _stream.ReadAsync(read, token);
 
         // Read the width, height and alpha mode
-        w = BitConverter.ToInt32(read, 0);
-        h = BitConverter.ToInt32(read, 4);
-        hasAlpha = read[8] == 1;
+        w = BitConverter.ToInt32(read.Span);
+        h = BitConverter.ToInt32(read.Span[4..]);
+        hasAlpha = read.Span[8] == 1;
         int size = w * h * 4;
-        bool hasSegment;
-        TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier seg;
-        {
-            hasSegment = TextureContentHelper.MemoryManager.GetChunkOrGcAlloc(size, out seg, out byte[] gcArray
-#if TRACE_GC_ALLOCS
-                        , $"Path texture {_stream switch {
-                            FileStream fs => fs.Name,
-                            _ => "Unknown path"
-                        }}"
-#endif
-            );
-            mem = hasSegment ? seg.SegId.Memory : gcArray;
-        }
-
-        Span<byte> buffer = mem.Span;
+//         bool hasSegment;
+//         TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier seg;
+//         {
+//             hasSegment = TextureContentHelper.MemoryManager.GetChunkOrGcAlloc(size, out seg, out byte[] gcArray
+// #if TRACE_GC_ALLOCS
+//                         , $"Path texture {_stream switch {
+//                             FileStream fs => fs.Name,
+//                             _ => "Unknown path"
+//                         }}"
+// #endif
+//             );
+//             mem = hasSegment ? seg.SegId.Memory : gcArray;
+//         }
+        memOwner = await TextureContentHelper.MemoryManager2.Rent(size);
+        mem = memOwner.Memory[..size];
+        // the first 9 bytes describe width, height and alpha mode (4+4+1), those have been read already
         if (hasAlpha) {
-            AsyncLoadInner<HasAlpha>(_stream, bytes, buffer);
+            // await AsyncLoadInner2<HasAlpha>(_stream, read[9..], mem);
+            AsyncLoadInner1<HasAlpha>(_stream, read.Span, mem.Span);
         } else {
-            AsyncLoadInner<NoAlpha>(_stream, bytes, buffer);
+            // await AsyncLoadInner2<NoAlpha>(_stream, read[9..], mem);
+            AsyncLoadInner1<NoAlpha>(_stream, read.Span, mem.Span);
         }
-        if (hasSegment)
-            segment = seg;
+        
+        // if (hasSegment)
+        //     segment = seg;
     }
     
-    public override Texture2D SyncLoad() {
-        Texture2D tex = new(Celeste.Instance.GraphicsDevice, w, h);
+    public override Texture2D UploadTexture() {
         unsafe {
             fixed (byte* ptr = mem.Span)
-                tex.SetData((IntPtr) ptr);
+                return ContentExtensions.TextureFromPointer(ContentExtensions.GetGraphicsDevice(), w, h, (IntPtr)ptr);
         }
-        return tex;
     }
     
-    public override void Dispose() {
-        if (segment.HasValue)
-            TextureContentHelper.MemoryManager.ReturnChunk(segment.Value);
-        segment = null;
-        _stream.Dispose();
+    protected override void Dispose(bool disposing) {
+        if (isDisposed) return;
+        if (disposing) {
+            _stream.Dispose();
+        }
+        // if (segment.HasValue)
+        //     TextureContentHelper.MemoryManager.ReturnChunk(segment.Value);
+        memOwner?.Dispose();
+        mem = Memory<byte>.Empty;
+        //segment = null;
+        isDisposed = true;
+    }
+
+    ~DataTextureLoader() {
+        Dispose(false);
     }
     
     // Abuse generics in order to get dead code elimination for optimal code on both cases
@@ -262,65 +333,136 @@ public sealed class DataTextureLoader : TextureLoader {
     // will keep reading from `stream` until all data is decoded.
     // Assumptions: read.Length >= bytesCheckSize, stream.Position == read.Length
     // TODO: This has too many range checks
-    private static void AsyncLoadInner<T>(Stream stream, byte[] read, Span<byte> to) where T : AlphaMode {
-        Span<byte> from = read;
-        Span<int> toI = MemoryMarshal.Cast<byte, int>(to);
+    private static unsafe void AsyncLoadInner1<T>(Stream stream, Span<byte> read, Span<byte> toSpan) where T : AlphaMode {
+        int size = toSpan.Length;
+        fixed (byte* to = toSpan)
+        fixed (byte* from = read) {
+            int* toI = (int*) to;
+            uint toIdxB = 0;
+            uint toIdxI = 0;
+            int readIdx = 9; // the first 9 bytes describe width, height and alpha mode (4+4+1), those have been read already
+            while (toIdxB < size) {
+                // Pixel values are run length encoded, this counts the number of pixels in this line
+                uint lineSize = from[readIdx];
+
+                bool zeroSplat = false;
+                if (typeof(T) == typeof(HasAlpha)) {
+                    // If there is a nonzero alpha, all 4 bytes are stored, if alpha is zero, a single byte is
+                    byte a = from[readIdx + 1];
+                    if (a > 0) {
+                        to[toIdxB] = from[readIdx + 4];
+                        to[toIdxB + 1] = from[readIdx + 3];
+                        to[toIdxB + 2] = from[readIdx + 2];
+                        to[toIdxB + 3] = a;
+                        readIdx += 1 + 4;
+                    } else {
+                        toI[toIdxI] = 0;
+                        readIdx += 1 + 1;
+                        zeroSplat = true;
+                    }
+                } else {
+                    to[toIdxB] = from[readIdx + 3];
+                    to[toIdxB + 1] = from[readIdx + 2];
+                    to[toIdxB + 2] = from[readIdx + 1];
+                    to[toIdxB + 3] = 255;
+                    readIdx += 4;
+                }
+
+                if (lineSize > 1) {
+                    if (typeof(T) == typeof(HasAlpha) && zeroSplat) {
+                        // If alpha was zero, bulk write 0 to the whole line
+                        Unsafe.InitBlockUnaligned(to + toIdxB + 4, 0, lineSize * 4 - 4);
+                    } else {
+                        // Write via integers for performance
+                        int splatValue = toI[toIdxI];
+                        for (uint jI = toIdxI + 1, end = toIdxI + lineSize; jI < end; jI++)
+                            toI[jI] = splatValue;
+                    }
+                }
+
+                // Advance
+                toIdxI += lineSize;
+                toIdxB = toIdxI * 4;
+
+                // If there is less than 32 bytes left, copy the remaining ones to the beginning and read from the stream again
+                if (readIdx > bytesCheckSize) {
+                    int offset = read.Length - readIdx;
+                    for (int oB = 0; oB < offset; oB++) {
+                        from[oB] = from[readIdx + oB];
+                    }
+                    _ = stream.Read(read[offset..]);
+                    readIdx = 0;
+                }
+            }
+        }
+    }
+    
+    private static async Task AsyncLoadInner2<T>(Stream stream, Memory<byte> from, Memory<byte> to) where T : AlphaMode {
+        unsafe { // Inside the loop we rely on this assumption to get better codegen
+            Trace.Assert(sizeof(int) == sizeof(Color));
+        }
         int size = to.Length;
-        int toIdxB = 0;
         int toIdxI = 0;
-        int readIdx = 9; // the first 9 bytes describe width, height and alpha mode (4+4+1), those have been read already
-        while (toIdxB < size && toIdxI < toI.Length) { // The second check is unnecessary, it tries to help the jit remove bounds checks
+        int fromIdx = 0;
+        while (toIdxI * 4 < size) {
+            ReadLine(from.Span, to.Span, ref fromIdx, ref toIdxI);
+            // If there is less than 32 bytes left, copy the remaining ones to the beginning and read from the stream again
+            if (from.Length - fromIdx > refillBufferMargin) continue;
+            from[fromIdx..].CopyTo(from);
+            int copyLen = from.Length - fromIdx;
+            _ = await stream.ReadAsync(from[copyLen..]);
+            fromIdx = 0;
+        }
+        return;
+
+        // This is in a separate method due to c# 12 not allowing the use of Span in async methods
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static void ReadLine(Span<byte> from, Span<byte> to, ref int fromIdx, ref int toIdxI) {
+            // Assumes sizeof(int) == sizeof(Color)
+            Span<int> toI = MemoryMarshal.Cast<byte, int>(to);
             // Pixel values are run length encoded, this counts the number of pixels in this line
-            uint lineSize = from[readIdx];
+            byte lineSize = from[fromIdx];
+            int toIdx = toIdxI * 4;
 
             bool zeroSplat = false;
             if (typeof(T) == typeof(HasAlpha)) {
                 // If there is a nonzero alpha, all 4 bytes are stored, if alpha is zero, a single byte is
-                byte a = from[readIdx + 1];
+                byte a = from[fromIdx + 1];
                 if (a > 0) {
-                    to[toIdxB] = from[readIdx + 4];
-                    to[toIdxB + 1] = from[readIdx + 3];
-                    to[toIdxB + 2] = from[readIdx + 2];
-                    to[toIdxB + 3] = a;
-                    readIdx += 1 + 4;
+                    to[toIdx] = from[fromIdx + 4];
+                    to[toIdx + 1] = from[fromIdx + 3];
+                    to[toIdx + 2] = from[fromIdx + 2];
+                    to[toIdx + 3] = a;
+                    fromIdx += 1 + 4;
                 } else {
                     toI[toIdxI] = 0;
-                    readIdx += 1 + 1;
+                    fromIdx += 1 + 1;
                     zeroSplat = true;
                 }
             } else {
-                to[toIdxB] = from[readIdx + 3];
-                to[toIdxB + 1] = from[readIdx + 2];
-                to[toIdxB + 2] = from[readIdx + 1];
-                to[toIdxB + 3] = 255;
-                readIdx += 4;
+                to[toIdx] = from[fromIdx + 3];
+                to[toIdx + 1] = from[fromIdx + 2];
+                to[toIdx + 2] = from[fromIdx + 1];
+                to[toIdx + 3] = 255;
+                fromIdx += 4;
             }
 
             if (lineSize > 1) {
                 if (typeof(T) == typeof(HasAlpha) && zeroSplat) {
                     // If alpha was zero, bulk write 0 to the whole line
-                    Unsafe.InitBlockUnaligned(ref to[toIdxB + 4], 0, lineSize * 4 - 4);
+                    toI[(toIdxI+1)..(toIdxI+lineSize)].Clear();
+                    //Unsafe.InitBlockUnaligned(ref to[toIdx + 4], 0, (uint)lineSize * 4 - 4);
                 } else {
                     // Write via integers for performance
                     int splatValue = toI[toIdxI];
-                    for (int jI = toIdxI + 1, end = toIdxI + (int)lineSize; jI < end; jI++)
-                        toI[jI] = splatValue;
+                    toI[(toIdxI+1)..(toIdxI+lineSize)].Fill(splatValue);
+                    // for (int jI = toIdxI + 1, end = toIdxI + lineSize; jI < end; jI++)
+                    //     toI[jI] = splatValue;
                 }
             }
 
             // Advance
-            toIdxI += (int)lineSize;
-            toIdxB = toIdxI * 4;
-
-            // If there is less than 32 bytes left, copy the remaining ones to the beginning and read from the stream again
-            if (readIdx > bytesCheckSize) {
-                int offset = read.Length - readIdx;
-                for (int oB = 0; oB < offset; oB++) {
-                    from[oB] = from[readIdx + oB];
-                }
-                _ = stream.Read(read, offset, read.Length - offset);
-                readIdx = 0;
-            }
+            toIdxI += lineSize;
         }
     }
 
@@ -339,7 +481,6 @@ public sealed class DataTextureLoader : TextureLoader {
         private readonly Func<Stream> _streamProvider;
         private readonly int preW;
         private readonly int preH;
-        public bool CouldPreload => true;
         
         // We use stream providers because we open the stream multiple times
         public DataPreLoader(Func<Stream> streamProvider) {
@@ -353,7 +494,8 @@ public sealed class DataTextureLoader : TextureLoader {
             preH = BitConverter.ToInt32(read[4..]);
         }
         
-        public Point GetPreloadedSize() => new(preW, preH);
+        public Point? GetPreloadedSize() => new(preW, preH);
+        
         public TextureLoader CreateLoader() {
             return new DataTextureLoader(_streamProvider);
         }
@@ -366,20 +508,18 @@ public sealed class XnbTextureLoader : TextureLoader {
     private XnbTextureLoader(string path) {
         _path = path;
     }
+
+    public override Task ProcessDataAndPrepareUpload(CancellationToken token) => Task.CompletedTask;
     
-    public override void AsyncLoad(CancellationToken token) {
-    }
-    
-    public override Texture2D SyncLoad() {
+    public override Texture2D UploadTexture() {
         return Engine.Instance.Content.Load<Texture2D>(_path!.Replace(".xnb", ""));
     }
 
     public class XnbPreLoader(string path) : IPreLoader {
-        public bool CouldPreload => false; // Never accelerated
-
-        public Point GetPreloadedSize() {
-            throw new InvalidOperationException();
+        public Point? GetPreloadedSize() { // Never accelerated
+            return null;
         }
+        
         public TextureLoader CreateLoader() {
             return new XnbTextureLoader(path);
         }
@@ -390,53 +530,69 @@ public sealed class SizeDefinedTextureLoader : TextureLoader {
     private readonly int _width;
     private readonly int _height;
     private readonly Color _color;
-    private TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier? _segment;
+    // private TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier? _segment;
     private Memory<byte> _data;
+    private IMemoryOwner<byte>? bufferOwner;
+    private bool isDisposed;
     private SizeDefinedTextureLoader(int width, int height, Color color) {
         _width = width;
         _height = height;
         _color = color;
-        _segment = null;
+        // _segment = null;
         _data = Memory<byte>.Empty;
     }
 
     // TODO: Use the token
-    public override void AsyncLoad(CancellationToken token) {
-        // Layout order for Color is unknown, but since it's guaranteed to be consistent everywhere this will work
-        bool hasSegment = TextureContentHelper.MemoryManager.GetChunkOrGcAlloc(_width * _height * Unsafe.SizeOf<Color>(),
-            out TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier seg, out byte[] gcArray
-    #if TRACE_GC_ALLOCS
-                , $"Sized texture {_width}x{_height}"
-    #endif
-        );
-        if (hasSegment)
-            _segment = seg;
-        _data = hasSegment ? seg.SegId.Memory : gcArray;
-        Span<Color> colorData = MemoryMarshal.Cast<byte, Color>(_data.Span);
-        colorData.Fill(_color);
-        token.ThrowIfCancellationRequested();
+    public override async Task ProcessDataAndPrepareUpload(CancellationToken token) {
+    //     // Layout order for Color is unknown, but since it's guaranteed to be consistent everywhere this will work
+    //     bool hasSegment = TextureContentHelper.MemoryManager.GetChunkOrGcAlloc(_width * _height * Unsafe.SizeOf<Color>(),
+    //         out TextureContentHelper.SpanPoolPool<byte>.SegmentIdentifier seg, out byte[] gcArray
+    // #if TRACE_GC_ALLOCS
+    //             , $"Sized texture {_width}x{_height}"
+    // #endif
+    //     );
+    //     if (hasSegment)
+    //         _segment = seg;
+
+        int size = _width * _height * Unsafe.SizeOf<Color>();
+        bufferOwner = await TextureContentHelper.MemoryManager2.Rent(size);
+        _data = bufferOwner.Memory[..size];
+        // _data = hasSegment ? seg.SegId.Memory : gcArray;
+        
+        FillBuffer(_data.Span, _color);
+        return;
+        static void FillBuffer(Span<byte> data, Color color) {
+            Span<Color> colorData = MemoryMarshal.Cast<byte, Color>(data);
+            colorData.Fill(color);
+        }
     }
     
-    public override Texture2D SyncLoad() {
-        Texture2D tex = new(Engine.Instance.GraphicsDevice, _width, _height);
+    public override Texture2D UploadTexture() {
         unsafe {
             fixed (byte* ptr = _data.Span) {
-                tex.SetData((IntPtr) ptr);
+                return ContentExtensions.TextureFromPointer(ContentExtensions.GetGraphicsDevice(), _width, _height, (IntPtr)ptr);
             }
         }
-        return tex;
     }
     
-    public override void Dispose() {
-        if (_segment != null)
-            TextureContentHelper.MemoryManager.ReturnChunk(_segment.Value);
-        _segment = null;
+    protected override void Dispose(bool disposing) {
+        if (isDisposed) return;
+        // if (_segment != null)
+        //     TextureContentHelper.MemoryManager.ReturnChunk(_segment.Value);
+        // _segment = null;
+        // _data = Memory<byte>.Empty;
+        _data = Memory<byte>.Empty;
+        bufferOwner?.Dispose();
+        isDisposed = true;
+    }
+
+    ~SizeDefinedTextureLoader() {
+        Dispose(false);
     }
 
     public class SizeDefinedPreLoader(int width, int height, Color color) : IPreLoader {
-        public bool CouldPreload => true;
         
-        public Point GetPreloadedSize() {
+        public Point? GetPreloadedSize() {
             return new Point(width, height);
         }
         
@@ -452,10 +608,12 @@ public static class TextureContentHelper {
     // high, not all loads check its own size because not all of them have a known size before it occurs
     private const int maxCheckedTextureSize = atlasSize * 8;
     internal static readonly FTLMemoryManager MemoryManager;
+    internal static readonly MemoryPoolMemoryLimiter<byte> MemoryManager2;
     
     static TextureContentHelper() {
         const int initialMemUsage = atlasSize * 4; // hardcoded for now, should be plenty to start and a good default
         MemoryManager = new FTLMemoryManager(initialMemUsage);
+        MemoryManager2 = new MemoryPoolMemoryLimiter<byte>(MemoryPool<byte>.Shared, initialMemUsage);
     }
 
     public static bool TryEnableFTL() {
@@ -486,9 +644,84 @@ public static class TextureContentHelper {
             Logger.Info("LoadContent", $"Enabling FTL with {limit} bytes");
             patch_VirtualTexture.FtlToggle = true;
             MemoryManager.SetAllocSize(limit);
+            MemoryManager2.MaxMemoryUsage = limit;
             return true;
         }
+
+        MemoryManager2.MaxMemoryUsage = long.MaxValue;
         return false;
+    }
+
+    public sealed class MemoryPoolMemoryLimiter<T>(MemoryPool<T> pool, long initialMemUsage) : IDisposable where T : struct {
+        private long _maxMemoryUsage = initialMemUsage/4;
+        public long MaxMemoryUsage {
+            get => _maxMemoryUsage;
+            set => _maxMemoryUsage = value switch {
+                -1 => initialMemUsage/4,
+                long.MaxValue => long.MaxValue,
+                _ => value/4
+            };
+        }
+        private long _currentMemoryUsage;
+        private readonly PriorityQueue<TaskCompletionSource<IMemoryOwner<T>>, int> _priorityQueue = new();
+
+        // ReSharper disable once InconsistentlySynchronizedField
+        public int MaxBufferSize => pool.MaxBufferSize;
+
+        public ValueTask<IMemoryOwner<T>> Rent(int minBufferSize) {
+            ArgumentOutOfRangeException.ThrowIfNegative(minBufferSize);
+            lock (pool) {
+                if (_currentMemoryUsage + minBufferSize <= MaxMemoryUsage) {
+                    return new ValueTask<IMemoryOwner<T>>(DoRentUnlocked(minBufferSize));
+                }
+
+                TaskCompletionSource<IMemoryOwner<T>> tcs = new();
+                _priorityQueue.Enqueue(tcs, minBufferSize);
+                return new ValueTask<IMemoryOwner<T>>(tcs.Task);
+            }
+        }
+
+        private MemoryOwnerWrapper DoRentUnlocked(int minBufferSize) {
+            IMemoryOwner<T> rent = pool.Rent(minBufferSize);
+            int rentedSize = rent.Memory.Length;
+            _currentMemoryUsage += rentedSize;
+            //Logger.Info(nameof(MemoryPoolMemoryLimiter<T>), $"Usage: {_currentMemoryUsage} bytes");
+            return new MemoryOwnerWrapper(this, rent, rentedSize);
+        }
+
+        private void NotifyReturn(long returnSize) {
+            lock (pool) {
+                _currentMemoryUsage -= returnSize;
+                //Logger.Info(nameof(MemoryPoolMemoryLimiter<T>), $"Usage: {_currentMemoryUsage} bytes");
+                Debug.Assert(_currentMemoryUsage >= 0);
+                while (_priorityQueue.Count > 0) {
+                    bool peek = _priorityQueue.TryPeek(out TaskCompletionSource<IMemoryOwner<T>>? tcs, out int priority);
+                    if (!peek) throw new UnreachableException();
+                    if (_currentMemoryUsage + priority > MaxBufferSize) break; // No space
+                    
+                    // There's space, let's rent now
+                    tcs!.SetResult(DoRentUnlocked(priority));
+                    _priorityQueue.Dequeue();
+                }
+            }
+        }
+
+        public void Dispose() {
+            if (_priorityQueue.Count > 0) throw new InvalidOperationException();
+            pool.Dispose();
+        }
+
+        private sealed class MemoryOwnerWrapper(MemoryPoolMemoryLimiter<T> limiter, IMemoryOwner<T> inner, long rentedSize) : IMemoryOwner<T> {
+            internal long RentedSize => rentedSize;
+            private bool isDisposed;
+            public void Dispose() {
+                if (isDisposed) return;
+                inner.Dispose();
+                limiter.NotifyReturn(rentedSize);
+                isDisposed = true;
+            }
+            public Memory<T> Memory => inner.Memory;
+        }
     }
     
 
@@ -504,8 +737,8 @@ public static class TextureContentHelper {
         private const int OtherThreadTimeout = -1;
         private const int PoolSize = atlasSize;
         // Managed
-        private readonly ResourceWaiter waitingForSpace = new(MainThreadTimeout, OtherThreadTimeout);
-        private readonly SpanPoolPool<byte> spanPool = new(PoolSize, (long)(initialMemUsage*SplitPercent));
+        // private readonly ResourceWaiter waitingForSpace = new(MainThreadTimeout, OtherThreadTimeout);
+        // private readonly SpanPoolPool<byte> spanPool = new(PoolSize, (long)(initialMemUsage*SplitPercent));
         
         // Unmanaged
         private long unmanagedMemoryUsage;
@@ -517,59 +750,59 @@ public static class TextureContentHelper {
         // that it's value ever rarely changes
         public long CurrMemUsage { get => Volatile.Read(ref _currMemUsage); private set => Volatile.Write(ref _currMemUsage, value); }
         
-        public bool GetChunkOrGcAlloc(int chunkSize, out SpanPoolPool<byte>.SegmentIdentifier seg, out byte[] gcArray
-#if TRACE_GC_ALLOCS
-        , string source
-#endif
-        ) {
-            if (chunkSize > PoolSize) { // It's not going to fit
-                if (chunkSize > maxCheckedTextureSize) { // Just no
-                    throw new InvalidOperationException($"Tried to obtain a chunk that is too large ({chunkSize})" 
-#if TRACE_GC_ALLOCS
-                                                        + $" for texture {source}:"
-#endif
-                    );
-                }
-                
-                // Just gc alloc it
-                Logger.Warn(nameof(TextureContentHelper), $"Chunk size was too big for the pool size ({chunkSize} > {PoolSize})!");
-#if TRACE_GC_ALLOCS
-                Logger.Warn(nameof(TextureContentHelper), $"For texture {source}:");
-                Logger.Warn(nameof(TextureContentHelper), new StackTrace().ToString());
-#endif
-                gcArray =  new byte[chunkSize];
-                seg = default;
-                return false;
-            }
-            
-            while (true) {
-                bool hasSegment = spanPool.TryRent(chunkSize, out seg);
-                if (hasSegment) {
-                    gcArray = [];
-                    return true;
-                }
-
-                if (!waitingForSpace.Wait()) // On timeout just exit and gc alloc
-                    break;
-            }
-        
-            bool isMainThread = MainThreadHelper.IsMainThread;
-            Logger.Warn(nameof(TextureContentHelper), $"Allocating {chunkSize} bytes in the gc because " +
-                                                                    $"{(isMainThread ? "the main-thread" : "a worker thread")} was " +
-                                                                    $"blocked for more than {(isMainThread ? MainThreadTimeout : OtherThreadTimeout)}ms");
-#if TRACE_GC_ALLOCS
-            Logger.Warn(nameof(TextureContentHelper), $"For texture {source}:");
-            Logger.Warn(nameof(TextureContentHelper), new StackTrace().ToString());
-#endif
-            gcArray = new byte[chunkSize];
-            seg = default;
-            return false;
-        }
-
-        public void ReturnChunk(SpanPoolPool<byte>.SegmentIdentifier seg) {
-            spanPool.Return(seg);
-            waitingForSpace.Pulse();
-        }
+//         public bool GetChunkOrGcAlloc(int chunkSize, out SpanPoolPool<byte>.SegmentIdentifier seg, out byte[] gcArray
+// #if TRACE_GC_ALLOCS
+//         , string source
+// #endif
+//         ) {
+//             if (chunkSize > PoolSize) { // It's not going to fit
+//                 if (chunkSize > maxCheckedTextureSize) { // Just no
+//                     throw new InvalidOperationException($"Tried to obtain a chunk that is too large ({chunkSize})" 
+// #if TRACE_GC_ALLOCS
+//                                                         + $" for texture {source}:"
+// #endif
+//                     );
+//                 }
+//                 
+//                 // Just gc alloc it
+//                 Logger.Warn(nameof(TextureContentHelper), $"Chunk size was too big for the pool size ({chunkSize} > {PoolSize})!");
+// #if TRACE_GC_ALLOCS
+//                 Logger.Warn(nameof(TextureContentHelper), $"For texture {source}:");
+//                 Logger.Warn(nameof(TextureContentHelper), new StackTrace().ToString());
+// #endif
+//                 gcArray =  new byte[chunkSize];
+//                 seg = default;
+//                 return false;
+//             }
+//             
+//             while (true) {
+//                 bool hasSegment = spanPool.TryRent(chunkSize, out seg);
+//                 if (hasSegment) {
+//                     gcArray = [];
+//                     return true;
+//                 }
+//
+//                 if (!waitingForSpace.Wait()) // On timeout just exit and gc alloc
+//                     break;
+//             }
+//         
+//             bool isMainThread = MainThreadHelper.IsMainThread;
+//             Logger.Warn(nameof(TextureContentHelper), $"Allocating {chunkSize} bytes in the gc because " +
+//                                                                     $"{(isMainThread ? "the main-thread" : "a worker thread")} was " +
+//                                                                     $"blocked for more than {(isMainThread ? MainThreadTimeout : OtherThreadTimeout)}ms");
+// #if TRACE_GC_ALLOCS
+//             Logger.Warn(nameof(TextureContentHelper), $"For texture {source}:");
+//             Logger.Warn(nameof(TextureContentHelper), new StackTrace().ToString());
+// #endif
+//             gcArray = new byte[chunkSize];
+//             seg = default;
+//             return false;
+//         }
+//
+//         public void ReturnChunk(SpanPoolPool<byte>.SegmentIdentifier seg) {
+//             spanPool.Return(seg);
+//             waitingForSpace.Pulse();
+//         }
         
 #if POOL_USAGE_LOGGING
         private DateTime lastLog;
@@ -644,10 +877,10 @@ public static class TextureContentHelper {
         public void SetAllocSize(long limit) {
             long prevMemUsage = CurrMemUsage;
             CurrMemUsage = limit == -1 ? initialMemUsage : limit;
-            spanPool.CurrMemUsage = (long) (CurrMemUsage * SplitPercent);
+            // spanPool.CurrMemUsage = (long) (CurrMemUsage * SplitPercent);
             if (prevMemUsage < CurrMemUsage) {
                 // Make everyone waiting recheck
-                waitingForSpace.Pulse();
+                // waitingForSpace.Pulse();
                 unmanagedWaitingForSpace.Pulse();
             }
         }
@@ -839,7 +1072,6 @@ public static class TextureContentHelper {
             }
         }
 
-        // Should always be called in a lock
         private (int, int)? NextFreeSegmentAndReserve(int minSize) {
             int prevIdx = 0;
             for (int i = 0; i < usedSegments.Count; i++) {
