@@ -342,8 +342,6 @@ https://discord.gg/6qjaePQ");
             foreach (EverestModule mod in Everest._Modules)
                 mod.LoadContent(firstLoad);
 
-            // There's no need to stop Ftl if it started in the first place ;)
-
             Everest._ContentLoaded = true;
         }
 

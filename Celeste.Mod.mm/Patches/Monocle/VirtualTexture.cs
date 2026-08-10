@@ -14,51 +14,45 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Debug = System.Diagnostics.Debug;
+using LTT = System.Lazy<System.Threading.Tasks.Task<Microsoft.Xna.Framework.Graphics.Texture2D>>;
 
 #nullable enable
 
-// FTL v2:
+// FTL v2, notes on the design and implementation:
 // This file hosts the implementation of FTL v2, Fast Texture Loading version 2.
 // 
 // Its main goal is to offload the work to other threads of reading the texture data, unpacking it 
 // and copying it to an array for upload to the GPU, so that the loading process is sped up by
-// asynchronously loading textures. Although the GPU uploads are synced back to the main thread.
+// asynchronously decoding textures. Although the GPU uploads are synced back to the main thread.
 // This last detail also fixes a bug in vanilla where GPU uploads could crash the game on rare occasions
 // on Nvidia gpus.
 //
-// It is enabled via the static field FtlToggle, so while that is false all loads will happen synchronously.
-// It is important to note that only loads invoked from the main thread will be offloaded to other threads,
-// this due to the assumption that if loading happens intentionally on a separate thread it is because loads
-// are meant to happen on that separate thread only.
+// It is enabled via the method TextureContentHelper.TryEnableFTL, so while that is false all loads
+// will happen synchronously.
 //
 // You will see that most work is sent to the TextureContentHelper, a helper class whose goal is to do the
-// actual loading of the data, as well as capping the current memory usage to not freeze the system (since
-// FTL simply offloads all loads onto other threads without checking system pressure).
+// actual loading of the data, as well as capping the current memory usage to not freeze the system.
 //
 // FTL also implements the ability to lazy load all textures: when a texture is created only its size is read
-// and no loading actually occurs, that only when its Texture2D is accessed for the first time. This leads to
-// massive gains on the game loading speed but at the cost of constant stutters on gameplay, thus it is not recommended
-// unless there are massive memory constraints. Although some mods may use the event
-// Everest.Events.VirtualTexture.ShouldForceLazyLoad to force a lazy load for specific textures, in case it has some extra 
-// knowledge of when the texture will be used.
+// and no loading actually occurs. This leads to massive gains on the game loading speed but at the cost of
+// constant stutters on gameplay, thus it is not recommended unless there are massive memory constraints. Although
+// some mods may use the event Everest.Events.VirtualTexture.ShouldForceLazyLoad to force a lazy load for specific
+// textures in case it has some extra knowledge of when the texture will be used.
 // There's also an event to track when a lazily loaded texture is loaded too late (on access) and may cause a gameplay stutter:
 // Everest.Events.VirtualTexture.OnLazyLoad.
-// It is important to note that not all textures can be preloaded (have its size loaded without fully loading the texture
-// itself), for those textures lazy loading will simply not happen.
+// Note that not all textures will be lazy loaded. Those which cannot be preloaded will just load normally (also skipping FTL).
 //
 // The FTL v2 implementation also has the added benefit of making VirtualTexture completely thread-safe.
 // This does not prevent race conditions on user code though.
 //
-// For backwards-compatibility sake it is allowed to resize textures (change its Width and Height) properties if and only if 
-// those were made using the (string name, int width, int height, Color color) constructor. All resizes will implicitly call
-// a reload and consecutively erase the contents if those were somehow modified. An additional property is provided so both
-// dimensions can be changed without calling two separate reloads: VirtualTexture.Size.
-// For backwards-compatibility sake it is also allowed to override the Texture2D that this VirtualTexture owns, doing so will
-// grant ownership of the newly given Texture2D to the VirtualTexture meaning if it were to be `Unload`ed the new Texture2D 
-// would be disposed. While the texture is overriden Reloads are nullified. If a reload were to be in progress when the texture
-// is overriden, it will be canceled and have no effect. If the texture is overriden while already being overriden the
-// VirtualTexture will take ownership of the new one and leave ownership of the old one. Finally, if the texture is overriden
-// with a null texture it would have the exact same effect as an Unload call.
+// For backwards-compatibility sake it is allowed to resize textures (change its Width and Height) properties if those were made
+// using the (string name, int width, int height, Color color) constructor. All resizes will implicitly call a reload and
+// erase the contents if those were somehow modified. 
+// For backwards-compatibility sake it is also allowed to override the Texture2D that this VirtualTexture owns. Doing so will
+// grant ownership of the newly given Texture2D to the VirtualTexture meaning if it were to be `Unload`ed or `Reload`ed the
+// new Texture2D would be disposed. If the texture is overriden while already being overriden the VirtualTexture will take
+// ownership of the new one and leave ownership of the old one. Finally, if the texture is overriden with a null texture it
+// would have the exact same effect as an Unload call.
 // 
 // Finally, this class is also tasked with the headless mode loading optimizations, where all textures which can be preloaded
 // will have its Texture2D set to a 1x1 texture, this is purely for performance’s sake. Textures which cannot be preloaded will
@@ -108,13 +102,14 @@ namespace Monocle {
                 
                 // Amortized slow path
                 lock (_textureLock) {
-                    // The lazy part is never used, unless the texture was lazy loaded and had not started loading until now
                     if (!_textureTask.IsValueCreated) {
+                        Everest.Events.VirtualTexture.LazyLoad((VirtualTexture) (object) this);
                         Logger.Debug(nameof(VirtualTexture), $"Loading texture {Name ?? "(Unnamed)"} on texture access!");
                     }
-                    Texture2D ret = _textureTask.Value.Result;
-                    _cachedTexture = ret;
-                    return ret;
+                    
+                    // Never call _textureTask.Value.Result without knowing you're not on main thread or that its completed!
+                    // Otherwise, we could deadlock!
+                    return _cachedTexture = SafeWaitForTextureUnlocked();
                 }
             }
             set {
@@ -126,9 +121,9 @@ namespace Monocle {
                     return;
                 }
                 lock (_textureLock) {
-                    CancelLoad();
-                    _textureTask = new Lazy<TextureTask>(TextureTask.FromResult(value));
-                    _cachedTexture = null;
+                    CancelLoadUnlocked();
+                    _textureTask = new LTT(Task.FromResult(value));
+                    _cachedTexture = value;
                     _width = value.Width;
                     _height = value.Height;
                 }
@@ -137,12 +132,10 @@ namespace Monocle {
 
         public bool IsDisposed {
             [MonoModReplace]
-            get => _disposed;
+            get => _disposed || 
+                   !Celeste.Celeste.Instance.GraphicsDevice.IsDisposed; // Vanilla also checks for the graphics device
         }
         
-        /// <summary>
-        /// This is not thread safe.
-        /// </summary>
         public bool IsLoaded => _textureTask is { IsValueCreated: true, Value.IsCompletedSuccessfully: true };
 
         public readonly ModAsset? Metadata;
@@ -151,12 +144,9 @@ namespace Monocle {
         private readonly object _textureLock;
         private CancellationTokenSource _cts;
         private TextureLoader.IPreLoader _preLoader;
-        private Lazy<TextureTask> _textureTask; // This is the new Texture_Unsafe
+        private LTT _textureTask; // This is the new Texture_Unsafe
         private Texture2D? _cachedTexture; // Fast way to access a texture, to avoid pointer chasing
         private bool _disposed;
-
-        // The main FTL toggle, see this class header for all the details
-        public static bool FtlToggle { get; internal set; }
 
         [MonoModConstructor]
         [MonoModReplace]
@@ -208,7 +198,7 @@ namespace Monocle {
         [MonoModReplace]
         internal override sealed void Reload() {
             lock (_textureLock) {
-                CancelLoad(); // Canceling is required because it disposes the texture if it got loaded
+                CancelLoadUnlocked(); // Canceling is required because it disposes the texture if it got loaded
                 // We need to reload the preloader too, in case there were any changes affecting it
                 _preLoader = CreatePreLoader();
                 InitializeTexture(false);
@@ -221,7 +211,8 @@ namespace Monocle {
         [MonoModReplace]
         internal override void Unload() {
             lock (_textureLock) {
-                CancelLoad(); // Canceling is required because it disposes the texture if it got loaded
+                CancelLoadUnlocked(); // Canceling is required because it disposes the texture if it got loaded
+                // No need to regenerate the preloader since Unload does not need to refresh data
                 InitializeTexture(true);
             }
         }
@@ -231,6 +222,9 @@ namespace Monocle {
         /// </summary>
         [MonoModReplace]
         public override void Dispose() {
+            // Disposing is weird in vanilla, it only unloads the texture and unregisters from VirtualContent
+            // here we keep this behavior and try to make IsDisposed monotone rather than being just a cheker
+            // for whether the texture is available and not disposed
             Unload();
             Volatile.Write(ref _disposed, true);
             patch_VirtualContent.Remove(this);
@@ -241,30 +235,47 @@ namespace Monocle {
                 case TextureKind.FileSystem: {
                     Debug.Assert(Path is not null);
                     return System.IO.Path.GetExtension(Path) switch {
-                        ".data" => new DataTextureLoader.DataPreLoader(StreamProvider),
-                        ".png" => new PNGTextureLoader.PNGPreLoader(StreamProvider, Path),
+                        ".data" => new DataTextureLoader.DataPreLoader(StreamProviderFS),
+                        ".png" => new PNGTextureLoader.PNGPreLoader(StreamProviderFS, Path),
                         ".xnb" => new XnbTextureLoader.XnbPreLoader(Path),
-                        _ => new FallbackTextureLoader.FallbackPreLoader(StreamProvider, false)
+                        _ => new FallbackTextureLoader.FallbackPreLoader(StreamProviderFS, false)
                     };
                     break;
-                    Stream StreamProvider() => File.OpenRead(System.IO.Path.Combine(Engine.ContentDirectory, Path));
+
+                    Stream StreamProviderFS(bool actualLoad) {
+                        return new FileStream(System.IO.Path.Combine(Engine.ContentDirectory, Path), 
+                            FileMode.Open, FileAccess.Read, FileShare.Read);
+                    }
                 }
                 case TextureKind.ModAsset: {
                     Debug.Assert(Metadata is not null);
                     // Old FTL code used to check if StreamProvider() == null, and if so assigned a fallback
                     // But this would have crashed on the old Preload function before this could happen so the
                     // new impl omits this check and assumes that it doesn't ever happen.
-                    Debug.Assert(StreamProvider() is not null);
-                    bool premul = false; // Assume unpremultiplied by default
-                    if (Metadata.TryGetMeta(out TextureMeta meta))
-                        premul = meta.Premultiplied;
+                    Debug.Assert(StreamProviderModAsset(false) is not null);
                     if (Metadata.Format == "png") {
-                        return new PNGTextureLoader.PNGPreLoader(StreamProvider, Name, !Metadata.StreamAsync);
+                        return new PNGTextureLoader.PNGPreLoader(StreamProviderModAsset, Name, !Metadata.StreamAsync);
                     } else {
-                        return new FallbackTextureLoader.FallbackPreLoader(StreamProvider, premul);
+                        bool premul = false; // Assume unpremultiplied by default
+                        if (Metadata.TryGetMeta(out TextureMeta meta))
+                            premul = meta.Premultiplied;
+                        return new FallbackTextureLoader.FallbackPreLoader(StreamProviderModAsset, premul);
                     }
                     break;
-                    Stream StreamProvider() => Metadata!.Stream;
+
+                    Stream StreamProviderModAsset(bool actualLoad) {
+                        Stream stream = Metadata.Stream;
+                        if (actualLoad) { 
+                            // Mod assets benefit from being copied into memory ahead of time to avoid lock contention
+                            // in the hot paths of texture loading.
+                            MemoryStream ms = new();
+                            stream.CopyTo(ms);
+                            stream.Dispose();
+                            ms.Position = 0;
+                            stream = ms;
+                        }
+                        return stream;
+                    }
                 }
                 case TextureKind.SizeDefined: {
                     Debug.Assert(_width > 0 && _height > 0);
@@ -283,26 +294,29 @@ namespace Monocle {
             _cachedTexture = null;
             if (Everest.Flags.IsHeadless) {
                 // On headless we always lazyload for performance reasons, so this has no use
-                Everest.Events.VirtualTexture.OnShouldForceLazyLoad((VirtualTexture) (object) this);
+                if (lazyOverride == null)
+                    Everest.Events.VirtualTexture.OnShouldForceLazyLoad((VirtualTexture) (object) this);
                 // If a preload is not possible just load the texture, even on headless,
                 // otherwise we risk having the wrong size, skipping loads entirely is just a
                 // performance optimization
-                if (_preLoader.GetPreloadedSize() == null && (_orig_width <= 0 || _orig_height <= 0)) {
-                    _textureTask = new Lazy<TextureTask>(CreateTask(_preLoader));
+                if (_orig_width > 0 && _orig_height > 0)
+                    _textureTask = new LTT(Task.FromResult(new Texture2D(Engine.Graphics.GraphicsDevice, _orig_width, _orig_height)));
+                else if (_preLoader.GetPreloadedSize() != null) {
+                    Point preloadedSize = _preLoader.GetPreloadedSize()!.Value;
+                    _textureTask = new LTT(Task.FromResult(new Texture2D(Engine.Graphics.GraphicsDevice, preloadedSize.X, preloadedSize.Y)));
                 } else {
-                    _textureTask = new Lazy<TextureTask>(TextureTask.FromResult(new Texture2D(Engine.Graphics.GraphicsDevice, 1, 1)));
+                    _textureTask = new LTT(CreateTask());
                 }
             } else {
                 // Try to lazily create the task eagerly, if there's no preload EnsurePublicFields will load it anyway
-                // TODO: should the event be called if lazyOverride == true??
-                bool doLazyLoad = Everest.Events.VirtualTexture.OnShouldForceLazyLoad((VirtualTexture) (object) this) || CoreModule.Settings.LazyLoading;
-                if (lazyOverride.HasValue) {
-                    doLazyLoad = lazyOverride.Value;
-                }
+                // Don't call the event when there's an override
+                bool doLazyLoad = lazyOverride ?? 
+                                  Everest.Events.VirtualTexture.OnShouldForceLazyLoad((VirtualTexture) (object) this) 
+                                  || CoreModule.Settings.LazyLoading;
                 if (doLazyLoad) {
-                    _textureTask = new Lazy<TextureTask>(() => CreateTask(_preLoader));
+                    _textureTask = new LTT(CreateTask); // Pass a delegate to make loading lazy
                 } else {
-                    _textureTask = new Lazy<TextureTask>(CreateTask(_preLoader));
+                    _textureTask = new LTT(CreateTask()); // Immediately call the loading routine to load immediately
                 }
             }
             EnsurePublicFields();
@@ -316,126 +330,69 @@ namespace Monocle {
                 _height = _orig_height;
                 return;
             }
-            Point? preLoadSize = _preLoader.GetPreloadedSize();
-            if (preLoadSize != null) {
-                Point size = preLoadSize.Value;
-                _width = size.X;
-                _height = size.Y;
-            } else {
-                // TextureTask has extra handling code to prevent deadlocks if the main thread needs
-                // to wait for a result, so this is safe
+            if (IsLoaded) { // If the texture is ready read from it to avoid unnecessary Preloads
                 Texture2D tex = _textureTask.Value.Result;
                 _width = tex.Width;
                 _height = tex.Height;
+            } else {
+                Point? preLoadSize = _preLoader.GetPreloadedSize();
+                if (preLoadSize != null) {
+                    Point size = preLoadSize.Value;
+                    _width = size.X;
+                    _height = size.Y;
+                } else {
+                    // Never call _textureTask.Value.Result without knowing you're not on main thread or that its completed!
+                    // Otherwise, we could deadlock!
+                    Texture2D tex = SafeWaitForTextureUnlocked();
+                    _width = tex.Width;
+                    _height = tex.Height;
+                }
             }
             _orig_width = _width;
             _orig_height = _height;
         }
         
         // Should always be in a lock
-        private void CancelLoad() {
+        private void CancelLoadUnlocked() {
             _cts.Cancel();
             _cts.Dispose();
             _cts = new CancellationTokenSource();
-            if (IsLoaded) {
-                _textureTask.Value.Result.Dispose();
-            } else if (_textureTask.IsValueCreated && _textureTask.Value.IsFaulted) {
+            if (IsLoaded) { // Dispose any loaded results
+                // Dispose should also be called on the main thread, there's no point in waiting since
+                // it doesn't really matter if the texture is disposed now or later.
+                MainThreadHelper.Schedule(_textureTask.Value.Result.Dispose);
+            } else if (_textureTask is { IsValueCreated: true, Value.IsFaulted: true }) { // Or fetch any exceptions that may have occurred
                 _ = _textureTask.Value.Result;
             }
         }
-        
-        private TextureTask CreateTask(TextureLoader.IPreLoader preLoader) {
-            // Note: CouldPreload == true is also equivalent to being able to run asynchronously
-            if (FtlToggle && preLoader.GetPreloadedSize() != null) {
-                return TextureTask.FromPreLoaderThreadPool(preLoader, _cts.Token);
+
+        // Waits for the texture to finish loading while ensuring no deadlocks occur due to stalling the main thread
+        private Texture2D SafeWaitForTextureUnlocked() {
+            Task<Texture2D> task = _textureTask.Value;
+            // Extra handling code to prevent deadlocks if the main thread needs to wait for a result
+            Debug.Assert(task != null);
+            if (MainThreadHelper.IsMainThread && !task.IsCompleted) {
+                if (MainThreadHelper.BusyWaitTask(TextureContentHelper.Pipeline.TryMoveToPriorityPipeline(task))) {
+                    Logger.Verbose(nameof(VirtualTexture), "Prioritized task!");
+                } else {
+                    if (!task.IsCompleted) {
+                        Logger.Verbose(nameof(VirtualTexture), "Couldn't prioritize task and it is not completed!");
+                    }
+                }
+                // On main thread let's just run other tasks while we wait
+                MainThreadHelper.BusyWaitTask(task);
             }
-            return TextureTask.FromPreLoaderNoThreadPool(preLoader);
+            return task.Result;
+        }
+        
+        private Task<Texture2D> CreateTask() {
+            return TextureContentHelper.CreateFTLTask(_preLoader, _cts.Token);
         }
 
         private enum TextureKind {
             FileSystem,
             ModAsset,
             SizeDefined
-        }
-
-        // Abstraction struct in order to prevent deadlocks due to having the main thread waiting on a task
-        private struct TextureTask {
-            private Texture2D? _result;
-            private readonly Task<Texture2D>? _task;
-            private readonly TaskCompletionSource<Task<Texture2D>>? _tcs;
-            
-            public Texture2D Result {
-                get {
-                    if (_result != null) {
-                        return _result;
-                    }
-                    Debug.Assert(_tcs != null && _task != null);
-                    if (MainThreadHelper.IsMainThread) {
-                        // On main thread let's just run other tasks while we wait
-                        MainThreadHelper.BusyWaitTask(_tcs.Task);
-                        // And run our task once it's ready
-                        MainThreadHelper.BusyWaitTask(_tcs.Task.Result);
-                    }
-                    return _result = _task.Result;
-                }
-            }
-            public bool IsCompleted => _result != null || _task!.IsCompleted;
-            public bool IsCompletedSuccessfully => _result != null || _task!.IsCompletedSuccessfully;
-            public bool IsFaulted => _result == null && _task!.IsFaulted;
-            private TextureTask(Texture2D result) {
-                _result = result;
-            }
-
-            private TextureTask(Task<Texture2D> task, TaskCompletionSource<Task<Texture2D>> tcs) {
-                _task = task;
-                _tcs = tcs;
-            }
-
-            public static TextureTask FromResult(Texture2D tex) {
-                return new TextureTask(tex);
-            }
-
-            public static TextureTask FromPreLoaderNoThreadPool(TextureLoader.IPreLoader preLoader) {
-                using TextureLoader loader = preLoader.CreateLoader();
-                Task processTask = loader.ProcessDataAndPrepareUpload(CancellationToken.None);
-                if (!processTask.IsCompletedSuccessfully) {
-                    // ReSharper disable once AccessToDisposedClosure
-                    Task t = Task.Factory.StartNew(() => processTask, CancellationToken.None, TaskCreationOptions.None, TaskScheduler.Default)
-                        .Unwrap();
-                    t.Wait();
-                }
-                ValueTask<Texture2D> vt = MainThreadHelper.Schedule(loader.UploadTexture, CancellationToken.None);
-                return new TextureTask(vt.IsCompletedSuccessfully ? vt.Result : vt.AsTask().Result);
-            }
-
-            public static TextureTask FromPreLoaderThreadPool(TextureLoader.IPreLoader preLoader, CancellationToken ct) {
-                TaskCompletionSource<Task<Texture2D>> tcs = new();
-                // Forcing the ThreadPool TaskScheduler is necessary here (TaskScheduler.Default) since if this were to be ran
-                // from the MainThreadScheduler the task factory would inherit it, causing this to run synchronously and
-                // later deadlocking in case the main thread calls this.Result, due to the Unwrap seen lower down
-                Task<Texture2D> task = Task.Factory.StartNew(async () => {
-                    TextureLoader loader;
-                    try {
-                        loader = preLoader.CreateLoader();
-                    } catch (Exception ex) {
-                        tcs.SetException(ex);
-                        throw;
-                    }
-                    using var _ = loader;
-                    Task<Texture2D> mainThreadTask;
-                    try {
-                        await loader.ProcessDataAndPrepareUpload(ct).ConfigureAwait(false);
-                        ct.ThrowIfCancellationRequested();
-                        mainThreadTask = MainThreadHelper.Schedule(loader.UploadTexture, ct).AsTask();
-                    } catch (Exception ex) { // We need to populate the tcs with the exception for any waiters there might be
-                        tcs.SetException(ex);
-                        throw;
-                    }
-                    tcs.SetResult(mainThreadTask); // This should never throw
-                    return await mainThreadTask.ConfigureAwait(false); // This needs to go outside the try because `SetResult` has been called already
-                }, ct, TaskCreationOptions.HideScheduler, TaskScheduler.Default).Unwrap();
-                return new TextureTask(task, tcs);
-            }
         }
     }
 
